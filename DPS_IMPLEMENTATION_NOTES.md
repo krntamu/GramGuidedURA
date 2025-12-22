@@ -223,7 +223,4 @@ Results are saved in `results/dm_dps/` directory:
 - `dps_diagnostic_recorder.py`: Diagnostic recording tool
 - `DMCE/diffusion_model.py`: Base diffusion model and tester integration
 
-## References
 
-- DPS paper: "Solving Inverse Problems in Medical Imaging with Score-Based Generative Models" (Chung et al., 2022)
-- DDIM paper: "Denoising Diffusion Implicit Models" (Song et al., 2020)
