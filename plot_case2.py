@@ -138,6 +138,53 @@ dps_cov_est_best = np.array([
     0.04566792
 ])
 
+dps_cov_oracle_sqrtbeta = np.array([
+    0.179403812,
+    0.156103522,
+    0.139285162,
+    0.128767744,
+    0.120300412,
+    0.114184693,
+    0.109616555,
+    0.105123289,
+    0.101252347,
+    0.097332999,
+    0.093530826,
+    0.08949618,
+    0.085361965,
+    0.079972036,
+    0.074803598,
+    0.069313399,
+    0.063627906,
+    0.057896528,
+    0.05318734,
+    0.047362495,
+    0.042795561
+])
+cbd_oracle = np.array([
+    0.219811067,
+    0.19705236,
+    0.179879472,
+    0.165927768,
+    0.153186992,
+    0.143654242,
+    0.135986388,
+    0.129242808,
+    0.123257726,
+    0.118758313,
+    0.114668503,
+    0.11050991,
+    0.105952352,
+    0.099880569,
+    0.094165929,
+    0.08781185,
+    0.080954589,
+    0.073548339,
+    0.06811215,
+    0.060045335,
+    0.054383531
+])
+
 # =========================
 # Figure 1: Main Comparison Plot (Best Configurations)
 # =========================
@@ -148,27 +195,43 @@ best_cov_lambda = 5e-4  # Best DPS-COV cov_lambda
 plt.figure(figsize=(7.6, 5.0))
 
 # Plot baseline: DDIM (unconditional diffusion model)
-plt.semilogy(snr, nmse_ddim, marker='o', label='DDIM')
+plt.semilogy(snr, nmse_ddim, marker='o', label='DM')
 
 # Plot DPS with best lambda
+#(lambda0.3)
 plt.semilogy(
     snr, dps[best_lambda],
     marker='s',
-    label=rf'DPS ($\lambda={best_lambda}$)'
+    label=rf'DPS'
 )
 
 # Plot DPS-COV with oracle covariance (perfect H H^H)
+#(lambda0.3, cov_lambda0.0005)
 plt.semilogy(
     snr, dps_cov_oracle[best_cov_lambda],
     marker='^',
-    label=rf'DPS-COV (oracle, $\lambda={best_lambda}$, $\lambda_{{cov}}={best_cov_lambda:g}$)'
+    label=rf'DPS-COV ($\lambda=0.3$, $\lambda_{{cov}}=0.0005$)'
 )
 
 # Plot DPS-COV with estimated covariance (time-averaged)
+# plt.semilogy(
+#     snr, dps_cov_est_best,
+#     marker='v', linestyle='--',
+#     label=rf'DPS-COV (est, $\lambda={best_lambda}$, $\lambda_{{cov}}={best_cov_lambda:g}$)'
+# )
+
+# Plot CBD with oracle covariance (perfect H H^H)
 plt.semilogy(
-    snr, dps_cov_est_best,
+    snr, cbd_oracle,
+    marker='x',
+    label=rf'DPS-COV ($\lambda=0$, $\lambda_{{cov}}=0.0005$)'
+)
+
+# Plot CBD with estimated covariance (time-averaged)
+plt.semilogy(
+    snr, dps_cov_oracle_sqrtbeta,
     marker='v', linestyle='--',
-    label=rf'DPS-COV (est, $\lambda={best_lambda}$, $\lambda_{{cov}}={best_cov_lambda:g}$)'
+    label=rf'DPS-COV (sqrt_beta_t)'
 )
 
 # Formatting

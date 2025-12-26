@@ -89,12 +89,12 @@ nmse_dps_cov_sqrtbeta = np.array([
 
 plt.figure(figsize=(7.2, 4.8))
 
-plt.semilogy(snr, nmse_ddim,         marker='o', label='DDIM')
+plt.semilogy(snr, nmse_ddim,         marker='o', label='DM')
 plt.semilogy(snr, nmse_dps,          marker='s', label='DPS')
-plt.semilogy(snr, nmse_dps_cov,      marker='^', label='DPS-COV (oracle)')
+plt.semilogy(snr, nmse_dps_cov,      marker='^', label='CGD (beta_t)')
 # plt.semilogy(snr, nmse_dps_cov_est,  marker='v', linestyle='--', label='DPS-COV (est)')
-plt.semilogy(snr, nmse_dps_cov_sqrtbeta,  marker='v', linestyle='--', label='DPS-COV (sqrtbeta)')
-plt.semilogy(snr, lmmse_genie,       marker='x', label='Genie (LMMSE)')
+plt.semilogy(snr, nmse_dps_cov_sqrtbeta,  marker='v', linestyle='--', label='CGD (sqrt_beta_t)')
+plt.semilogy(snr, lmmse_genie,       marker='x', label='LMMSE')
 
 
 plt.xlim([-15, 5])

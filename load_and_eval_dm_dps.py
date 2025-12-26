@@ -148,6 +148,9 @@ def parse_args() -> argparse.Namespace:
     except ValueError:
         raise ValueError(f'Invalid dps_lambda format: {args.dps_lambda}. Use comma-separated floats like "0.1,0.3,0.5"')
     
+    # Debug: print parsed dps_lambda values
+    print(f"[DEBUG] Parsed --dps_lambda: '{args.dps_lambda}' -> {args.dps_lambdas}")
+    
     return args
 
 

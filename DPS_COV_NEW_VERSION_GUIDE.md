@@ -99,7 +99,17 @@ python load_and_eval_dm_dps.py \
     --ch_type 3gpp \
     --n_path 3
 ```
-
+For quadriga channel estimation, the recommended default parameters are:
+```bash
+python load_and_eval_dm_dps.py \
+    --ch_type quadriga_LOS
+    --method dps_cov_oracle \
+    --cov_lambda 0.00005 \
+    --cov_scale_mode sqrt_beta_t \
+    --cov_grad_norm none \
+    --cov_step_clip 2.0 \
+    --dps_lambda 0.3 \
+```
 **Parameter Explanation:**
 - `--cov_lambda 0.01`: Moderate covariance guidance strength
 - `--cov_scale_mode sqrt_beta_t`: Balanced scaling that decays slower than `beta_t`
