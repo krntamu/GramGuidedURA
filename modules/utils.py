@@ -263,31 +263,66 @@ def _maybe_view_as_subclass(original_array, new_array):
     return new_array
 
 
-def complex_1d_fft(input_tensor, ifft=False, _4d_array=False, mode='1D'):
+def complex_1d_fft(input_tensor, ifft=False, _4d_array=False, mode='1D', debug=False):
     # Assuming input_tensor has shape (batches, 2, dim)
+
+    if debug:
+        print(f"    [DEBUG complex_1d_fft]")
+        print(f"      input shape: {input_tensor.shape}")
+        print(f"      _4d_array: {_4d_array}, mode: {mode}, ifft: {ifft}")
 
     # Combine real and imaginary parts to form complex numbers
     if _4d_array:
+        if debug:
+            print(f"      Treating input as 4D array: extracting slices along dim 2")
+            print(f"      input_tensor[:, :, 0].shape = {input_tensor[:, :, 0].shape}")
+            print(f"      input_tensor[:, :, 1].shape = {input_tensor[:, :, 1].shape}")
         complex_numbers = torch.view_as_complex(torch.stack([input_tensor[:, :, 0], input_tensor[:, :, 1]], dim=-1))
+        if debug:
+            print(f"      After stack: complex_numbers.shape = {complex_numbers.shape}")
     else:
+        if debug:
+            print(f"      Treating input as 2-channel: extracting dim 1")
+            print(f"      input_tensor[:, 0].shape = {input_tensor[:, 0].shape}")
+            print(f"      input_tensor[:, 1].shape = {input_tensor[:, 1].shape}")
         complex_numbers = torch.view_as_complex(torch.stack([input_tensor[:, 0], input_tensor[:, 1]], dim=-1))
+        if debug:
+            print(f"      After stack: complex_numbers.shape = {complex_numbers.shape}")
 
     # Perform 1D FFT along the last dimension
     if ifft:
         if mode == '1D':
+            if debug:
+                print(f"      Calling torch.fft.ifft(complex_numbers, dim=-1, norm='ortho')")
             fft_result = torch.fft.ifft(complex_numbers, dim=-1, norm="ortho")
         else:
+            if debug:
+                print(f"      Calling torch.fft.ifft2(complex_numbers, dim=(-2, -1), norm='ortho')")
             fft_result = torch.fft.ifft2(complex_numbers, dim=(-2, -1), norm="ortho")
     else:
         if mode == '1D':
+            if debug:
+                print(f"      Calling torch.fft.fft(complex_numbers, dim=-1, norm='ortho')")
             fft_result = torch.fft.fft(complex_numbers, dim=-1, norm="ortho")
         else:
+            if debug:
+                print(f"      Calling torch.fft.fft2(complex_numbers, dim=(-2, -1), norm='ortho')")
             fft_result = torch.fft.fft2(complex_numbers, dim=(-2, -1), norm="ortho")
+    
+    if debug:
+        print(f"      After FFT/IFFT: fft_result.shape = {fft_result.shape}")
 
     # Reshape to real-valued representation
     if _4d_array:
+        if debug:
+            print(f"      Reshaping: stacking real/imag along dim 2")
         fft_result = torch.stack([fft_result.real, fft_result.imag], dim=2)
     else:
+        if debug:
+            print(f"      Reshaping: stacking real/imag along dim 1")
         fft_result = torch.stack([fft_result.real, fft_result.imag], dim=1)
+    
+    if debug:
+        print(f"      Final output shape: {fft_result.shape}")
 
     return fft_result
