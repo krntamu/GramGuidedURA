@@ -20,6 +20,7 @@ from typing import Callable, Optional, Literal
 
 import torch
 from torch import Tensor
+from DMCE import utils as dm_utils
 
 
 # -------------------------- Likelihood gradient -------------------------- #
@@ -179,6 +180,8 @@ class DpsSampler(object):
         H=None,
         sigma_y2: Optional[float] = None,
         lambda_dps: Optional[float] = None,
+        exp_key: Literal['A', 'B', 'C', 'D'] = 'A',
+        gamma: float = 1.0,
     ) -> None:
         """
         Parameters
@@ -241,8 +244,28 @@ class DpsSampler(object):
         # This allows strong mid-SNR updates while preventing high-SNR instability
         self.grad_clip = None        # Do NOT clip gradients (they can be large, that's OK)
         self.step_clip = 2.0         # Clip final correction magnitude (C=1~5 recommended, using 2.0 as default)
+        
+        # Ablation experiment key: A=baseline, B=scalar Jacobian, C=autograd gold, D=soft-gated
+        self.exp_key = exp_key
+        self.gamma = float(gamma)  # For experiment D: soft-gated likelihood guidance
+        self.debug_likelihood = False  # Enable debug prints for likelihood guidance
+        self.gamma = float(gamma)  # For experiment D: soft-gated likelihood guidance
+        
+        # Extract sigma_y2 from likelihood_grad_fn closure for experiment C
+        # This is needed for the autograd loss computation
+        if exp_key == 'C':
+            if hasattr(likelihood_grad_fn, '__closure__') and likelihood_grad_fn.__closure__:
+                self.sigma_y2_for_exp_c = likelihood_grad_fn.__closure__[0].cell_contents
+            elif sigma_y2 is not None:
+                self.sigma_y2_for_exp_c = sigma_y2
+            else:
+                # Fallback: try to extract from function name or use default
+                self.sigma_y2_for_exp_c = 1.0
+                import warnings
+                warnings.warn("Could not extract sigma_y2 for experiment C, using default 1.0")
+        else:
+            self.sigma_y2_for_exp_c = None
 
-    @torch.no_grad()
     def reverse_step_dps(self, x_t: Tensor, y: Tensor, cov: Tensor, t: int, diagnostic_recorder=None) -> Tensor:
         """
         Single DPS reverse step at discrete time index t.
@@ -254,26 +277,167 @@ class DpsSampler(object):
         3) Apply correction: x_prev = x_prior + eta_t * grad_like(x_prior, y)
         
         This ensures the gradient is evaluated at the denoised estimate, not the noisy state.
-        """
-        # 1) Unconditional prior reverse step
-        x_prior = self.dm.reverse_step(x_t, t, add_random=self.add_random)
         
-        # 2) Compute likelihood gradient at the prior estimate (not at noisy x_t)
-        # For AWGN: grad_like = (y - x_prior) / sigma_y2
-        # This gradient can be large at high SNR (when sigma_y2 is tiny), which is expected.
-        grad_like = self.likelihood_grad_fn(x_prior, y, t)
+        Ablation experiments:
+        - A: Baseline (ignore Jacobian)
+        - B: Scalar Jacobian approximation (1/sqrt(alpha_bar_t))
+        - C: Autograd gold gradient (full Jacobian via autograd)
+        """
+        # For experiments A and B, we can use no_grad context
+        # For experiment C, we need gradients enabled
+        if self.exp_key == 'C':
+            # Experiment C: Autograd "gold" gradient
+            # Enable gradients for x_t
+            x_t_requires_grad = x_t.clone().requires_grad_(True)
+            
+            # Compute H0_hat(Ht) with gradients enabled
+            # NOTE: self.dm.reverse_step() is decorated with @torch.no_grad(),
+            # so we need to manually implement the reverse step logic here
+            with torch.enable_grad():
+                # Manually implement reverse_step without @torch.no_grad() decorator
+                # This is a copy of the logic from dm.reverse_step() but without no_grad
+                b, *_ = x_t_requires_grad.shape
+                batched_times = torch.full((b,), t, device=self.dm.device, dtype=torch.long)
+                
+                if self.dm.reverse_method == 'reverse_mean':
+                    if self.dm.objective == 'pred_noise':
+                        pred_noise = self.dm.model(x_t_requires_grad, batched_times)
+                        # Manually compute posterior mean from noise (differentiable version)
+                        # Formula from get_posterior_mean_from_noise: 
+                        # posterior_mean = sqrt_recip_alphas * x_t - post_mean_from_noise_coef * noise
+                        sqrt_recip_alphas = dm_utils.extract(self.dm.sqrt_recip_alphas, batched_times, x_t_requires_grad.shape)
+                        post_mean_from_noise_coef = dm_utils.extract(self.dm.post_mean_from_noise_coef, batched_times, x_t_requires_grad.shape)
+                        x_prior_grad = sqrt_recip_alphas * x_t_requires_grad - post_mean_from_noise_coef * pred_noise
+                    elif self.dm.objective == 'pred_x_0':
+                        x_0_pred = self.dm.model(x_t_requires_grad, batched_times)
+                        # Manually compute posterior mean from x_0 (differentiable version)
+                        # Formula from get_posterior_mean_from_x_0:
+                        # posterior_mean = posterior_mean_coef_x_0 * x_0 + posterior_mean_coef_x_t * x_t
+                        posterior_mean_coef_x_0 = dm_utils.extract(self.dm.posterior_mean_coef_x_0, batched_times, x_0_pred.shape)
+                        posterior_mean_coef_x_t = dm_utils.extract(self.dm.posterior_mean_coef_x_t, batched_times, x_t_requires_grad.shape)
+                        x_prior_grad = posterior_mean_coef_x_0 * x_0_pred + posterior_mean_coef_x_t * x_t_requires_grad
+                    elif self.dm.objective == 'pred_post_mean':
+                        x_prior_grad = self.dm.model(x_t_requires_grad, batched_times)
+                    else:
+                        raise ValueError(f'Objective {self.dm.objective} is not supported.')
+                    
+                    # For deterministic steps (add_random=False), x_pred = posterior_mean
+                    # No need to add noise
+                else:
+                    raise ValueError(f'Reverse method {self.dm.reverse_method} is not supported for experiment C.')
+                
+                # Compute loss: (1/(2*sigma_y2)) * ||Y - H0_hat(Ht)||_F^2
+                sigma_y2 = self.sigma_y2_for_exp_c
+                diff = y - x_prior_grad
+                loss_like = (1.0 / (2.0 * sigma_y2)) * torch.sum(diff ** 2)
+                
+                # Compute gradient: gradHt = -d(loss_like)/d(Ht)
+                grad_like = -torch.autograd.grad(
+                    loss_like, 
+                    x_t_requires_grad, 
+                    retain_graph=False, 
+                    create_graph=False,
+                    only_inputs=True
+                )[0]
+            
+            # Detach to avoid graph growth
+            grad_like = grad_like.detach()
+            x_prior = x_prior_grad.detach()
+        else:
+            # Experiments A and B: use no_grad context
+            with torch.no_grad():
+                # 1) Unconditional prior reverse step
+                x_prior = self.dm.reverse_step(x_t, t, add_random=self.add_random)
+                
+                # 2) Compute likelihood gradient at the prior estimate (not at noisy x_t)
+                # For AWGN: grad_like_H0 = (y - x_prior) / sigma_y2
+                # This is ∇_{H0} log p(Y|H0), but we need ∇_{Ht} log p(Y|Ht)
+                grad_like_H0 = self.likelihood_grad_fn(x_prior, y, t)
+                
+                # Ablation experiments: convert ∇_{H0} to ∇_{Ht} using chain rule
+                # For experiments A, B, D: we compute a scalar multiplier for grad_like_H0
+                # For experiment C: grad_like is computed via autograd (handled separately above)
+                if self.exp_key == 'A':
+                    # Baseline: ignore Jacobian, use gradient w.r.t. H0 directly
+                    # like_scalar_t = beta_t (will be applied in correction computation)
+                    grad_like = grad_like_H0
+                elif self.exp_key == 'B':
+                    # Scalar Jacobian approximation: multiply by 1/sqrt(alpha_bar_t)
+                    # This approximates the Jacobian J_t = ∂H0_hat/∂Ht
+                    # like_scalar_t = beta_t / sqrt(alpha_bar_t) (will be applied in correction computation)
+                    alpha_bar_t = self.dm.alphas_cumprod[t]
+                    jacobian_scalar = 1.0 / torch.sqrt(alpha_bar_t + 1e-12)
+                    shape_ones = (1,) * (x_prior.ndim - 1)
+                    jacobian_scalar = jacobian_scalar.view(1, *shape_ones).to(x_prior.device)
+                    grad_like = jacobian_scalar * grad_like_H0
+                elif self.exp_key == 'D':
+                    # Soft-gated likelihood guidance: like_scalar_t = beta_t * alpha_bar_t^(gamma - 1/2)
+                    # This provides early-step suppression while retaining late-step benefits
+                    # For gamma=0.5: like_scalar_t = beta_t (should match A exactly)
+                    grad_like = grad_like_H0  # Don't multiply scalar into grad_like here
+                else:
+                    raise ValueError(f"Unknown exp_key: {self.exp_key}. Must be 'A', 'B', 'C', or 'D'.")
 
-        # 3) Step size: use theory-consistent form
-        # eta_t = lambda_dps * beta_t
-        # This is the standard DPS formulation. We stabilize via correction clipping (step 4).
-        beta_t = self.dm.betas[t]  # scalar
-        # print(f"beta_t: {beta_t}")
-        # print(f"t: {t}")
-        shape_ones = (1,) * (x_prior.ndim - 1)  # broadcast over non-batch dims
-        eta_t = self.dps_lambda * beta_t.view(1, *shape_ones)
-
-        # Compute correction: eta_t * grad_like = lambda_dps * beta_t * (y - x_prior) / sigma_y2
-        correction = eta_t * grad_like
+        # 3) Compute likelihood guidance scalar and apply correction
+        # Unified formula: correction = lambda_dps * like_scalar_t * grad_like_H0
+        # where like_scalar_t depends on the experiment:
+        #   A: like_scalar_t = beta_t
+        #   B: like_scalar_t = beta_t / sqrt(alpha_bar_t)
+        #   D: like_scalar_t = beta_t * alpha_bar_t^(gamma - 1/2)
+        with torch.no_grad():
+            beta_t = self.dm.betas[t]  # scalar
+            shape_ones = (1,) * (x_prior.ndim - 1)  # broadcast over non-batch dims
+            
+            if self.exp_key == 'A':
+                # Baseline: like_scalar_t = beta_t
+                like_scalar_t = beta_t.view(1, *shape_ones)
+            elif self.exp_key == 'B':
+                # Scalar Jacobian: like_scalar_t = beta_t / sqrt(alpha_bar_t)
+                # Note: grad_like already has 1/sqrt(alpha_bar_t) applied, so we just multiply by beta_t
+                like_scalar_t = beta_t.view(1, *shape_ones)
+            elif self.exp_key == 'D':
+                # Soft-gated: like_scalar_t = beta_t * alpha_bar_t^(gamma - 1/2)
+                alpha_bar_t = self.dm.alphas_cumprod[t]
+                # Numerical safety: clamp alpha_bar_t to avoid NaN from very small values
+                alpha_eff = torch.clamp(alpha_bar_t, min=1e-12)
+                # Compute scalar: beta_t * alpha_bar_t^(gamma - 1/2)
+                exponent = self.gamma - 0.5
+                like_scalar_t = beta_t * (alpha_eff ** exponent)
+                like_scalar_t = like_scalar_t.view(1, *shape_ones).to(x_prior.device)
+            else:
+                # Experiment C: use beta_t (autograd already computed full gradient)
+                like_scalar_t = beta_t.view(1, *shape_ones)
+            
+            # Compute correction: lambda_dps * like_scalar_t * grad_like
+            # For A: correction = lambda_dps * beta_t * grad_like_H0
+            # For B: correction = lambda_dps * beta_t * (1/sqrt(alpha_bar_t)) * grad_like_H0
+            # For D: correction = lambda_dps * beta_t * alpha_bar_t^(gamma-1/2) * grad_like_H0
+            correction = self.dps_lambda * like_scalar_t * grad_like
+            
+            # Debug mode: print detailed information for micro-test
+            if self.debug_likelihood:
+                alpha_bar_t_val = self.dm.alphas_cumprod[t].item() if self.exp_key in ['B', 'D'] else None
+                like_scalar_val = like_scalar_t.mean().item() if isinstance(like_scalar_t, torch.Tensor) else like_scalar_t
+                grad_like_norm = torch.linalg.vector_norm(grad_like, dim=tuple(range(1, grad_like.ndim))).mean().item()
+                correction_norm = torch.linalg.vector_norm(correction, dim=tuple(range(1, correction.ndim))).mean().item()
+                
+                print(f"[DEBUG t={t}] exp_key={self.exp_key}, gamma={self.gamma if self.exp_key == 'D' else 'N/A'}")
+                print(f"  beta_t={beta_t.item():.6e}, alpha_bar_t={alpha_bar_t_val:.6e if alpha_bar_t_val is not None else 'N/A'}")
+                print(f"  like_scalar_t={like_scalar_val:.6e}")
+                print(f"  ||grad_like||_2={grad_like_norm:.6e}")
+                print(f"  ||correction||_2={correction_norm:.6e}")
+                print(f"  grad_like finite: {torch.isfinite(grad_like).all().item()}, correction finite: {torch.isfinite(correction).all().item()}")
+                
+                # Hard equivalence test for gamma=0.5
+                if self.exp_key == 'D' and abs(self.gamma - 0.5) < 1e-6:
+                    # Compute what A would produce
+                    like_scalar_A = beta_t.view(1, *shape_ones)
+                    correction_A = self.dps_lambda * like_scalar_A * grad_like_H0
+                    rel_error = torch.linalg.vector_norm(correction - correction_A, dim=tuple(range(1, correction.ndim))).mean().item()
+                    rel_error /= (torch.linalg.vector_norm(correction_A, dim=tuple(range(1, correction_A.ndim))).mean().item() + 1e-12)
+                    print(f"  [EQUIVALENCE TEST] ||correction_D - correction_A|| / ||correction_A|| = {rel_error:.6e}")
+                    if rel_error > 1e-6:
+                        print(f"  WARNING: D(gamma=0.5) should match A but rel_error={rel_error:.6e} > 1e-6")
 
         # 4) Clip the FINAL correction (not the gradient) to prevent explosion
         # This allows strong mid-SNR updates while preventing high-SNR instability
@@ -433,6 +597,21 @@ class DpsSampler(object):
 
         # 4) Apply DPS correction to the prior estimate
         x_prev = x_prior + correction + correction_cov
+        
+        # Debug mode: print state change
+        if self.debug_likelihood:
+            state_change_norm = torch.linalg.vector_norm(x_prev - x_prior, dim=tuple(range(1, x_prev.ndim))).mean().item()
+            print(f"  ||x_prev - x_prior||_2={state_change_norm:.6e}")
+            print(f"  x_prev finite: {torch.isfinite(x_prev).all().item()}")
+            print()
+            # Disable debug after 3 steps
+            if hasattr(self, '_debug_step_count'):
+                self._debug_step_count += 1
+                if self._debug_step_count >= 3:
+                    self.debug_likelihood = False
+            else:
+                self._debug_step_count = 1
+        
         return x_prev
 
     @torch.no_grad()

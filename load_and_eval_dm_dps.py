@@ -149,6 +149,24 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Enable debug prints in FFT diagnostics (shows detailed FFT operation info).',
     )
+    parser.add_argument(
+        '--exp_key',
+        type=str,
+        default='A',
+        choices=['A', 'B', 'C', 'D'],
+        help='Ablation experiment key: A=baseline (current), B=scalar Jacobian (1/sqrt(alpha_bar_t)), C=autograd gold gradient, D=soft-gated (beta_t * alpha_bar_t^(gamma-1/2))',
+    )
+    parser.add_argument(
+        '--gamma',
+        type=float,
+        default=1.0,
+        help='Gamma parameter for experiment D (soft-gated likelihood guidance). Default: 1.0. Formula: lambda_t = beta_t * alpha_bar_t^(gamma - 1/2)',
+    )
+    parser.add_argument(
+        '--debug_likelihood',
+        action='store_true',
+        help='Enable debug mode for likelihood guidance: print detailed info for first 3 reverse steps',
+    )
     args = parser.parse_args()
     
     # Parse lambda values
@@ -849,6 +867,24 @@ def main() -> None:
         print(f"Number of reverse steps: {args.num_steps}")
     if args.record_diagnostics:
         print("Diagnostic recording: ENABLED")
+    if args.exp_key in ['A', 'B', 'C', 'D']:
+        print(f"Ablation experiment: {args.exp_key}")
+        if args.exp_key == 'A':
+            print("  Baseline: no Jacobian correction")
+        elif args.exp_key == 'B':
+            print("  Using scalar Jacobian approximation: 1/sqrt(alpha_bar_t)")
+        elif args.exp_key == 'C':
+            print("  Using autograd gold gradient (full Jacobian)")
+        elif args.exp_key == 'D':
+            print(f"  Using soft-gated likelihood guidance: beta_t * alpha_bar_t^(gamma - 1/2)")
+            print(f"    gamma = {args.gamma}")
+            if args.gamma == 1.0:
+                print("    (gamma=1.0: lambda_t = beta_t * sqrt(alpha_bar_t), strong early suppression)")
+            elif args.gamma == 0.75:
+                print("    (gamma=0.75: lambda_t = beta_t * alpha_bar_t^(1/4), milder suppression)")
+            elif args.gamma == 0.5:
+                print("    (gamma=0.5: lambda_t = beta_t, reduces to baseline A)")
+        print("  IMPORTANT: For ablation, SNR matching is DISABLED (using full T)")
     print(f"{'='*60}\n")
     
     # Custom test function that uses specified SNR range
@@ -931,6 +967,8 @@ def main() -> None:
                         cov_step_clip=args.cov_step_clip,
                         sigma_y2=sigma_y2_snr,
                         add_random=False,
+                        exp_key=args.exp_key,
+                        gamma=args.gamma,
                     )
                     # Enable t_start-based scaling if requested
                     if args.use_t_start_scaling:
@@ -940,6 +978,10 @@ def main() -> None:
                     # Enable debug logging if requested
                     if args.debug_cov_scaling:
                         dps_sampler.debug_cov_scaling = True
+                    # Enable likelihood debug mode if requested (only for first batch)
+                    if args.debug_likelihood and batch_idx == 0:
+                        dps_sampler.debug_likelihood = True
+                        dps_sampler._debug_step_count = 0
                 else:
                     dps_sampler = None
                 
@@ -984,12 +1026,17 @@ def main() -> None:
                             if args.record_diagnostics and args.method in ('dps_cov_oracle', 'dps_cov_est') and DpsDiagnosticRecorder is not None:
                                 diagnostic_recorder = DpsDiagnosticRecorder(record_enabled=True)
                             
+                            # For ablation experiments (A/B/C), disable SNR matching
+                            # Use full T (original failed setting) instead of SNR-matched timestep
+                            # All three experiments must use identical evaluation protocol
+                            snr_for_loop = None if args.exp_key in ['A', 'B', 'C', 'D'] else snr
+                            
                             x_est = dps_sampler.generate_posterior_sample(
                                 y.to(device=tester.device),
                                 cov=cov.to(device=tester.device),
                                 return_all_timesteps=tester.return_all_timesteps,
                                 num_steps=args.num_steps,
-                                snr=snr,  # Pass SNR to enable SNR-based timestep selection
+                                snr=snr_for_loop,  # Pass None for ablation to use full T
                                 diagnostic_recorder=diagnostic_recorder,
                             )
                             
@@ -1212,6 +1259,12 @@ def main() -> None:
                 suffix += '_tstart_scaled'
         if args.method == 'dps_cov_est':
             suffix += f'_ntime={args.n_time_samples}_mod={args.modulation}'
+        # Add experiment key to suffix for ablation experiments
+        if args.exp_key != 'A':
+            suffix += f'_exp={args.exp_key}'
+            # For experiment D, also include gamma value
+            if args.exp_key == 'D':
+                suffix += f'_gamma={args.gamma:.2f}'
         
         rows_full = list(zip(snrs, nmse_final, steps, times, tps))
         export_table(
@@ -1236,6 +1289,7 @@ def main() -> None:
             'lambda': dps_lambda,
             'snrs': snrs,
             'nmse': nmse_final,
+            'exp_key': args.exp_key,
         })
         
         # Save diagnostic summaries if recorded
@@ -1264,6 +1318,37 @@ def main() -> None:
             print(f"  Diagnostic summaries saved to: {diag_dir}/")
         
         print(f"\n✓ Lambda {dps_lambda} completed. Results saved.\n")
+    
+    # Print summary table for ablation experiments (if multiple exp_keys or non-A)
+    unique_exp_keys = set(r.get('exp_key', 'A') for r in all_results)
+    if len(unique_exp_keys) > 1 or (len(unique_exp_keys) == 1 and 'A' not in unique_exp_keys):
+        print("\n" + "="*70)
+        print("Ablation Summary: Mean NMSE at each SNR")
+        print("="*70)
+        print(f"{'SNR (dB)':>10} ", end="")
+        for result in all_results:
+            exp_key = result.get('exp_key', 'A')
+            print(f"{'Exp ' + exp_key:>15} ", end="")
+        print()
+        print("-"*70)
+        
+        # Find common SNR values
+        all_snrs_set = set()
+        for result in all_results:
+            all_snrs_set.update(result['snrs'])
+        common_snrs = sorted(all_snrs_set)
+        
+        for snr in common_snrs:
+            print(f"{snr:>10.1f} ", end="")
+            for result in all_results:
+                snrs = result['snrs']
+                nmse = result['nmse']
+                # Find closest SNR
+                idx = min(range(len(snrs)), key=lambda i: abs(snrs[i] - snr))
+                nmse_val = nmse[idx]
+                print(f"{nmse_val:>15.6e} ", end="")
+            print()
+        print("="*70)
     
     # Save comparison table (all lambdas in one file)
     if len(args.dps_lambdas) > 1:
