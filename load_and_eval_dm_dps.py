@@ -76,6 +76,13 @@ def parse_args() -> argparse.Namespace:
              '"sqrt_beta_t", "constant", "snr_aware".',
     )
     parser.add_argument(
+        '--cov_beta_power',
+        type=float,
+        default=None,
+        help='Optional override for cov scaling: use zeta_t = beta_t**p instead of --cov_scale_mode. '
+             'Examples: p=1.0 -> beta_t, p=0.5 -> sqrt_beta_t, p=0.0 -> constant, p=-0.5 -> snr_aware-like.',
+    )
+    parser.add_argument(
         '--cov_grad_norm',
         type=str,
         default='none',
@@ -89,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Separate clipping threshold for covariance correction. '
              'If None, uses default step_clip (backward compatible).',
+    )
+    parser.add_argument(
+        '--cov_clip_mode',
+        type=str,
+        default='auto',
+        choices=['auto', 'elementwise', 'norm'],
+        help="Clipping mode for covariance correction. "
+             "'auto' (default) preserves backward compatibility: elementwise clamp for legacy beta_t path, norm clip otherwise. "
+             "'elementwise' clamps each element to [-C, C]. "
+             "'norm' rescales the whole update to have L2 norm <= C (preserves direction).",
     )
     parser.add_argument(
         '--use_t_start_scaling',
@@ -153,8 +170,8 @@ def parse_args() -> argparse.Namespace:
         '--exp_key',
         type=str,
         default='A',
-        choices=['A', 'B', 'C', 'D'],
-        help='Ablation experiment key: A=baseline (current), B=scalar Jacobian (1/sqrt(alpha_bar_t)), C=autograd gold gradient, D=soft-gated (beta_t * alpha_bar_t^(gamma-1/2))',
+        choices=['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G'],
+        help='Ablation experiment key: A=baseline (current), B=scalar Jacobian (1/sqrt(alpha_bar_t)), C=autograd gold gradient, D=soft-gated (beta_t * alpha_bar_t^(gamma-1/2)), E=closed-form likelihood (score injection), Eprime=diagnostic closed-form post-add (sigma_t^2 scaling), F=paper-style reverse optimization update, G=paper Algorithm-3 style (DDIM step + posterior correction)',
     )
     parser.add_argument(
         '--gamma',
@@ -166,6 +183,78 @@ def parse_args() -> argparse.Namespace:
         '--debug_likelihood',
         action='store_true',
         help='Enable debug mode for likelihood guidance: print detailed info for first 3 reverse steps',
+    )
+    parser.add_argument(
+        '--debug_cf',
+        action='store_true',
+        help="Enable closed-form likelihood debug prints (exp E/F/G): print coefficient/norm diagnostics at a few timesteps for the first batch.",
+    )
+    parser.add_argument(
+        '--debug_cf_microtest',
+        action='store_true',
+        help="Run a fast closed-form micro-test: only 3 reverse steps (t=T-1, T//2, 0). Useful for quick sanity checks.",
+    )
+    parser.add_argument(
+        '--g_tau1',
+        type=int,
+        default=0,
+        help="Exp G only: stop the Algorithm-3 posterior-correction loop at timestep tau1 (>=1 recommended). "
+             "If 0, runs all the way to t=0 (often unstable).",
+    )
+    parser.add_argument(
+        '--enable_snr_matching',
+        action='store_true',
+        help="Enable SNR-matched start timestep selection (t_start) even for ablation experiments. "
+             "By default, ablations disable SNR matching to use the full reverse chain.",
+    )
+    parser.add_argument(
+        '--like_weight',
+        type=float,
+        default=1.0,
+        help='Scale factor for exp E closed-form likelihood score (score_total = score_prior + like_weight * score_like_cf).',
+    )
+    parser.add_argument(
+        '--lw_schedule',
+        type=str,
+        default='const',
+        choices=['const', 'ramp', 'lastk'],
+        help="Likelihood weight schedule for exp E. 'const' uses --like_weight. 'ramp' uses gated linear ramp based on alpha_bar_t. 'lastk' boosts only the last K steps.",
+    )
+    parser.add_argument(
+        '--lw_tau',
+        type=float,
+        default=0.95,
+        help='Ramp gate threshold tau for lw_schedule=ramp. Default: 0.95.',
+    )
+    parser.add_argument(
+        '--lw_max',
+        type=float,
+        default=8.0,
+        help='Ramp maximum w_max for lw_schedule=ramp. Default: 8.0.',
+    )
+    parser.add_argument(
+        '--lw_end',
+        type=float,
+        default=1.0,
+        help='Last-K schedule end weight for lw_schedule=lastk. Used when t <= lw_k. Default: 1.0.',
+    )
+    parser.add_argument(
+        '--lw_k',
+        type=int,
+        default=0,
+        help='Last-K schedule K for lw_schedule=lastk. Boost applies when t <= lw_k. Default: 0 (only t=0).',
+    )
+    parser.add_argument(
+        '--record_like_balance',
+        action='store_true',
+        help='Record per-step likelihood-vs-prior strength diagnostics for exp E (saves CSV for first batch of each SNR).',
+    )
+    parser.add_argument(
+        '--like_beta_power',
+        type=float,
+        default=1.0,
+        help='Ablation knob for post-add DPS (exp A/B/C/D only): replace beta_t with beta_t**p in the likelihood correction operator. '
+             'Default: 1.0 (no change). Example: p=2.0 tests beta_t^2.',
     )
     args = parser.parse_args()
     
@@ -856,9 +945,12 @@ def main() -> None:
     print(f"Method: {args.method}")
     if args.method in ('dps_cov_oracle', 'dps_cov_est'):
         print(f"Cov scale mode: {args.cov_scale_mode}")
+        if args.cov_beta_power is not None:
+            print(f"Cov beta power override: {args.cov_beta_power}   (zeta_t = beta_t**p)")
         print(f"Cov grad norm: {args.cov_grad_norm}")
         print(f"Cov lambda: {args.cov_lambda}")
         print(f"Cov step clip: {args.cov_step_clip}")
+        print(f"Cov clip mode: {args.cov_clip_mode}")
         if args.use_t_start_scaling:
             print(f"Per-step scaling: ENABLED (cov_lambda_eff(t) = cov_lambda_base * sqrt(beta[t]) for each step)")
     if args.num_steps is None:
@@ -867,7 +959,7 @@ def main() -> None:
         print(f"Number of reverse steps: {args.num_steps}")
     if args.record_diagnostics:
         print("Diagnostic recording: ENABLED")
-    if args.exp_key in ['A', 'B', 'C', 'D']:
+    if args.exp_key in ['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G']:
         print(f"Ablation experiment: {args.exp_key}")
         if args.exp_key == 'A':
             print("  Baseline: no Jacobian correction")
@@ -884,7 +976,23 @@ def main() -> None:
                 print("    (gamma=0.75: lambda_t = beta_t * alpha_bar_t^(1/4), milder suppression)")
             elif args.gamma == 0.5:
                 print("    (gamma=0.5: lambda_t = beta_t, reduces to baseline A)")
-        print("  IMPORTANT: For ablation, SNR matching is DISABLED (using full T)")
+        elif args.exp_key == 'E':
+            print("  Using closed-form likelihood (paper-style): score_total = score_prior + like_weight * score_like_cf")
+            print(f"    like_weight = {args.like_weight}")
+            if args.debug_cf:
+                print("  Debug CF enabled: will run only 3 reverse steps (t=T-1, T//2, 0) for a fast sanity check.")
+        elif args.exp_key == 'Eprime':
+            print("  Diagnostic: closed-form post-add using sigma_t^2 * score_like_cf (no beta_t)")
+        elif args.exp_key == 'F':
+            print("  Paper-style reverse optimization update: H_t <- H_t + post_var_t * score_post, then noise injection")
+            print(f"    like_weight = {args.like_weight}")
+        elif args.exp_key == 'G':
+            print("  Paper Algorithm-3 style: deterministic DDIM step + explicit posterior correction with closed-form likelihood gradient")
+            print("    (In exp G, dps_lambda acts as the paper's lambda in Step 5 correction.)")
+        if args.enable_snr_matching:
+            print("  IMPORTANT: SNR matching is ENABLED (t_start uses user SNR).")
+        else:
+            print("  IMPORTANT: For ablation, SNR matching is DISABLED (using full T)")
     print(f"{'='*60}\n")
     
     # Custom test function that uses specified SNR range
@@ -939,6 +1047,8 @@ def main() -> None:
                 steps_list.append(int(t_hat))
                 
                 if tester.use_dps:
+                    # Note: for method='dps' we set cov_lambda=0.0 below (no covariance guidance),
+                    # but args.cov_lambda is still printed elsewhere for reproducibility of settings.
                     print(f"\n[SNR {snr_db:.1f} dB] Processing with DPS (lambda={tester.dps_lambda:.3f}, "
                           f"method={args.method}, cov_lambda={args.cov_lambda})...")
                 else:
@@ -963,12 +1073,22 @@ def main() -> None:
                         lambda_dps=tester.dps_lambda,
                         cov_lambda=cov_lambda,
                         cov_scale_mode=args.cov_scale_mode,
+                        cov_beta_power=args.cov_beta_power,
                         cov_grad_norm=args.cov_grad_norm,
                         cov_step_clip=args.cov_step_clip,
+                        cov_clip_mode=args.cov_clip_mode,
                         sigma_y2=sigma_y2_snr,
                         add_random=False,
                         exp_key=args.exp_key,
                         gamma=args.gamma,
+                        like_weight=args.like_weight,
+                        lw_schedule=args.lw_schedule,
+                        lw_tau=args.lw_tau,
+                        lw_max=args.lw_max,
+                        lw_end=args.lw_end,
+                        lw_k=args.lw_k,
+                        g_tau1=args.g_tau1,
+                        like_beta_power=args.like_beta_power,
                     )
                     # Enable t_start-based scaling if requested
                     if args.use_t_start_scaling:
@@ -978,10 +1098,6 @@ def main() -> None:
                     # Enable debug logging if requested
                     if args.debug_cov_scaling:
                         dps_sampler.debug_cov_scaling = True
-                    # Enable likelihood debug mode if requested (only for first batch)
-                    if args.debug_likelihood and batch_idx == 0:
-                        dps_sampler.debug_likelihood = True
-                        dps_sampler._debug_step_count = 0
                 else:
                     dps_sampler = None
                 
@@ -996,6 +1112,30 @@ def main() -> None:
                     try:
                         data_batch = data_batch.to(device=tester.device)
                         y = functional.awgn(data_batch, snr, multiplier=tester.model.noise_multiplier)
+
+                        # --------------------------------------------------------------
+                        # Per-batch debug toggles (only for the first batch)
+                        # --------------------------------------------------------------
+                        if tester.use_dps and dps_sampler is not None:
+                            if args.debug_likelihood and batch_idx == 0:
+                                dps_sampler.debug_likelihood = True
+                                dps_sampler._debug_step_count = 0
+                            else:
+                                dps_sampler.debug_likelihood = False
+
+                            if args.debug_cf and args.exp_key in ('E', 'Eprime', 'F', 'G') and batch_idx == 0:
+                                dps_sampler.debug_cf = True
+                            else:
+                                dps_sampler.debug_cf = False
+
+                            # Optional micro-test mode (3 reverse steps). Independent from debug prints.
+                            dps_sampler.debug_cf_microtest = bool(args.debug_cf_microtest and batch_idx == 0)
+                            
+                            if args.record_like_balance and args.exp_key == 'E' and batch_idx == 0:
+                                dps_sampler.record_like_balance = True
+                                dps_sampler.like_balance_history = []
+                            else:
+                                dps_sampler.record_like_balance = False
                         
                         # Only debug first sample
                         if args.debug_cov_scaling and batch_idx == 0 and not debug_csv_saved:
@@ -1026,10 +1166,12 @@ def main() -> None:
                             if args.record_diagnostics and args.method in ('dps_cov_oracle', 'dps_cov_est') and DpsDiagnosticRecorder is not None:
                                 diagnostic_recorder = DpsDiagnosticRecorder(record_enabled=True)
                             
-                            # For ablation experiments (A/B/C), disable SNR matching
-                            # Use full T (original failed setting) instead of SNR-matched timestep
-                            # All three experiments must use identical evaluation protocol
-                            snr_for_loop = None if args.exp_key in ['A', 'B', 'C', 'D'] else snr
+                            # For ablation experiments, default is to disable SNR matching (use full T),
+                            # but the user can override with --enable_snr_matching.
+                            if args.exp_key in ['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G'] and (not args.enable_snr_matching):
+                                snr_for_loop = None
+                            else:
+                                snr_for_loop = snr
                             
                             x_est = dps_sampler.generate_posterior_sample(
                                 y.to(device=tester.device),
@@ -1100,7 +1242,10 @@ def main() -> None:
                                 debug_dir = Path('results') / 'dm_dps' / 'debug_cov_scaling'
                                 debug_dir.mkdir(parents=True, exist_ok=True)
                                 
-                                csv_file = debug_dir / f'debug_snr{snr_db:.1f}_scale_{args.cov_scale_mode}_norm_{args.cov_grad_norm}.csv'
+                                cov_scale_tag = args.cov_scale_mode
+                                if args.cov_beta_power is not None:
+                                    cov_scale_tag = f'beta_pow{args.cov_beta_power:g}'
+                                csv_file = debug_dir / f'debug_snr{snr_db:.1f}_scale_{cov_scale_tag}_norm_{args.cov_grad_norm}_clip_{args.cov_clip_mode}.csv'
                                 
                                 with open(csv_file, 'w', newline='') as f:
                                     writer = csv.writer(f)
@@ -1126,7 +1271,10 @@ def main() -> None:
                                 dx_preclip_vals = [r['dx_cov_preclip_norm'] for r in dps_sampler.debug_history]
                                 dx_postclip_vals = [r['dx_cov_postclip_norm'] for r in dps_sampler.debug_history]
                                 
-                                print(f"\n  [Debug Summary] cov_scale_mode={args.cov_scale_mode}")
+                                if args.cov_beta_power is not None:
+                                    print(f"\n  [Debug Summary] cov_beta_power={args.cov_beta_power} (override, zeta_t=beta_t**p)")
+                                else:
+                                    print(f"\n  [Debug Summary] cov_scale_mode={args.cov_scale_mode}")
                                 print(f"    zeta_t: min={min(zeta_vals):.6e}, mean={sum(zeta_vals)/len(zeta_vals):.6e}, max={max(zeta_vals):.6e}")
                                 print(f"    dx_cov_preclip_norm: min={min(dx_preclip_vals):.6e}, mean={sum(dx_preclip_vals)/len(dx_preclip_vals):.6e}, max={max(dx_preclip_vals):.6e}")
                                 print(f"    dx_cov_postclip_norm: min={min(dx_postclip_vals):.6e}, mean={sum(dx_postclip_vals)/len(dx_postclip_vals):.6e}, max={max(dx_postclip_vals):.6e}")
@@ -1136,6 +1284,32 @@ def main() -> None:
                                 
                                 # Disable debug for remaining batches
                                 dps_sampler.debug_cov_scaling = False
+
+                        # Save like-balance diagnostics after first sample (exp E only)
+                        if args.record_like_balance and args.exp_key == 'E' and batch_idx == 0:
+                            if tester.use_dps and dps_sampler is not None and len(getattr(dps_sampler, 'like_balance_history', [])) > 0:
+                                import csv
+                                from pathlib import Path
+
+                                debug_dir = Path('results') / 'dm_dps' / 'debug_like_balance'
+                                debug_dir.mkdir(parents=True, exist_ok=True)
+                                if args.lw_schedule == 'ramp':
+                                    csv_file = debug_dir / f'like_balance_snr{snr_db:.1f}_ramp_tau{args.lw_tau:.2f}_wmax{args.lw_max:.0f}.csv'
+                                elif args.lw_schedule == 'lastk':
+                                    csv_file = debug_dir / f'like_balance_snr{snr_db:.1f}_lastk_k{args.lw_k}_wend{args.lw_end:.0f}.csv'
+                                else:
+                                    csv_file = debug_dir / f'like_balance_snr{snr_db:.1f}_lw{args.like_weight:.3f}.csv'
+
+                                rows = sorted(dps_sampler.like_balance_history, key=lambda r: r['t'], reverse=True)
+                                with open(csv_file, 'w', newline='') as f:
+                                    writer = csv.writer(f)
+                                    writer.writerow(['t', 'alpha_bar_t', 'beta_t', 'like_weight', 'lw_schedule', 'lw_tau', 'lw_max', 'w_t', 'P_t', 'L_t', 'r_t', 'P0', 'L0', 'r0'])
+                                    for r in rows:
+                                        writer.writerow([r['t'], r['alpha_bar_t'], r['beta_t'], r['like_weight'], r.get('lw_schedule', ''), r.get('lw_tau', ''), r.get('lw_max', ''), r.get('w_t', ''), r['P_t'], r['L_t'], r['r_t'], r['P0'], r['L0'], r['r0']])
+
+                                r_vals = [r['r_t'] for r in rows]
+                                print(f"\n  [Like-balance] Saved CSV: {csv_file}")
+                                print(f"    r_t = L_t/(P_t+eps): min={min(r_vals):.3e}, mean={sum(r_vals)/len(r_vals):.3e}, max={max(r_vals):.3e}")
                     except Exception as e:
                         print(f"Error in batch {batch_idx}: {e}")
                         raise
@@ -1254,7 +1428,11 @@ def main() -> None:
         suffix = f'_method={method_name}_dps_lambda={dps_lambda}_sigma={args.sigma_y2}'
         if args.method in ('dps_cov_oracle', 'dps_cov_est'):
             suffix += f'_cov_lambda={args.cov_lambda}'
-            suffix += f'_scale={args.cov_scale_mode}'
+            if args.cov_beta_power is not None:
+                suffix += f'_scale=beta_pow{args.cov_beta_power:g}'
+            else:
+                suffix += f'_scale={args.cov_scale_mode}'
+            suffix += f'_clip={args.cov_clip_mode}'
             if args.use_t_start_scaling:
                 suffix += '_tstart_scaled'
         if args.method == 'dps_cov_est':
@@ -1265,6 +1443,13 @@ def main() -> None:
             # For experiment D, also include gamma value
             if args.exp_key == 'D':
                 suffix += f'_gamma={args.gamma:.2f}'
+            # For experiment E/Eprime, add explicit tag
+            if args.exp_key == 'E':
+                suffix += '_closedform'
+            if args.exp_key == 'Eprime':
+                suffix += '_closedform_postadd'
+            if args.exp_key == 'F':
+                suffix += '_paper'
         
         rows_full = list(zip(snrs, nmse_final, steps, times, tps))
         export_table(
@@ -1308,8 +1493,11 @@ def main() -> None:
                     if args.method in ('dps_cov_oracle', 'dps_cov_est'):
                         f.write(f"  Cov lambda: {args.cov_lambda}\n")
                         f.write(f"  Cov scale mode: {args.cov_scale_mode}\n")
+                        if args.cov_beta_power is not None:
+                            f.write(f"  Cov beta power override: {args.cov_beta_power} (zeta_t = beta_t**p)\n")
                         f.write(f"  Cov grad norm: {args.cov_grad_norm}\n")
                         f.write(f"  Cov step clip: {args.cov_step_clip}\n")
+                        f.write(f"  Cov clip mode: {args.cov_clip_mode}\n")
                     f.write(f"\nMid-to-Late Stage Statistics (t in [0.6T, 0.9T]):\n")
                     f.write(f"  Mean(c_t / b_t): {summary.get('mean_c_over_b', 'N/A'):.6f}\n")
                     f.write(f"  Mean(clip_rate_cov): {summary.get('mean_clip_rate_cov', 'N/A'):.6f}\n")

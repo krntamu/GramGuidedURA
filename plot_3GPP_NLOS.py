@@ -6,6 +6,7 @@ This script visualizes DPS and DPS-COV performance for 3GPP NLOS channel.
 Methods compared:
 - DM: DDIM (unconditional diffusion model, baseline)
 - DM + First-Order Guidance: DPS (lambda=0.1)
+- DM + Closed-Form Likelihood (Exp E): DPS with closed-form likelihood score injection (paper Theorem-1 style)
 - DM + Multi-Order Guidance (oracle, sqrt(beta_t)): DPS-COV with oracle covariance
 - DM + Multi-Order Guidance (est, sqrt(beta_t)): DPS-COV with estimated covariance
 - LMMSE: Linear Minimum Mean Square Error (genie-aided, upper bound)
@@ -57,6 +58,26 @@ nmse_fog = np.array([
     0.066486768
 ])
 
+# FOG_CF: DPS (Exp E) closed-form likelihood score injection (exp_key=E)
+# Source: terminal output table SNR -15..5 (step 1) from load_and_eval_dm_dps.py
+# - nmse_fog_cf_e_snr_match: with SNR matching (t_start) enabled
+# - nmse_fog_cf_e_fullT: without SNR matching (full reverse chain)
+nmse_fog_cf_e = np.array([
+    9.093432e-01, 8.700707e-01, 8.176520e-01, 7.546990e-01, 6.863842e-01,
+    6.193473e-01, 5.470487e-01, 4.820425e-01, 4.200711e-01, 3.654773e-01,
+    3.175669e-01, 2.756021e-01, 2.390080e-01, 2.061705e-01, 1.774397e-01,
+    1.521594e-01, 1.301131e-01, 1.107215e-01, 9.371015e-02, 7.937575e-02,
+    6.680968e-02
+], dtype=float)
+
+nmse_fog_cf_e_fullT = np.array([
+    9.602736e-01, 9.445305e-01, 9.233588e-01, 8.954188e-01, 8.574855e-01,
+    8.141812e-01, 7.576047e-01, 6.917177e-01, 6.189027e-01, 5.443640e-01,
+    4.699221e-01, 4.004216e-01, 3.382464e-01, 2.837459e-01, 2.375206e-01,
+    1.984276e-01, 1.654709e-01, 1.374218e-01, 1.140154e-01, 9.470135e-02,
+    7.823673e-02
+], dtype=float)
+
 # MOG_ORACLE_BETA: DPS-COV with oracle covariance, using beta_t scaling
 nmse_mog_oracle_beta = np.array([
     0.942350209, 0.854864717, 0.764093459, 0.67789036,  0.594796062,
@@ -77,26 +98,10 @@ nmse_mog_est_beta = np.array([
 
 # MOG_ORACLE_SQRTBETA: DPS-COV with oracle covariance, using sqrt(beta_t) scaling
 nmse_mog_oracle_sqrtbeta = np.array([
-    0.801430464,
-    0.720343709,
-    0.648588121,
-    0.57714802,
-    0.512298167,
-    0.451562792,
-    0.393757194,
-    0.342622906,
-    0.295749933,
-    0.254043192,
-    0.217772707,
-    0.185272902,
-    0.157341585,
-    0.13236919,
-    0.111656912,
-    0.094020076,
-    0.078858458,
-    0.065990075,
-    0.055385161,
-    0.046284296,
+    0.801430464, 0.720343709, 0.648588121, 0.57714802, 0.512298167,
+    0.451562792, 0.393757194, 0.342622906, 0.295749933, 0.254043192,
+    0.217772707, 0.185272902, 0.157341585, 0.13236919, 0.111656912,
+    0.094020076, 0.078858458, 0.065990075, 0.055385161, 0.046284296,
     0.038781099
 ])
 
@@ -143,6 +148,7 @@ plt.figure(figsize=(8.0, 5.5))
 # Define colors for consistent styling (using more distinct colors)
 color_dm = '#1f77b4'          # Blue
 color_fog = '#ff7f0e'         # Orange
+color_fog_cf = '#17becf'      # Cyan
 color_mog_oracle = '#2ca02c'  # Green
 color_mog_est = '#d62728'     # Red
 color_lmmse = '#9467bd'       # Purple
@@ -164,34 +170,50 @@ plt.semilogy(
     snr, nmse_fog,
     marker='s', markersize=markersize, markevery=markevery,
     label='FOG', color=color_fog, linewidth=linewidth
+    # label='FOG (Tweedie)', color=color_fog, linewidth=linewidth
 )
 
-# Plot DPS-COV with oracle covariance, using beta_t scaling
-plt.semilogy(
-    snr, nmse_mog_oracle_beta,
-    marker='s', linestyle='--', markersize=markersize, markevery=markevery,
-    label='MOG (oracle, $\\beta_t$)', color=color_mog_oracle, linewidth=linewidth
-)
+# # Plot DPS (Exp E) closed-form likelihood score injection
+# plt.semilogy(
+#     snr, nmse_fog_cf_e,
+#     marker='D', markersize=markersize, markevery=markevery,
+#     label='FOG (closed-form, SNR-matched)', color=color_fog_cf, linewidth=linewidth
+# )
 
-# Plot DPS-COV with estimated covariance, using beta_t scaling
-plt.semilogy(
-    snr, nmse_mog_est_beta,
-    marker='^', linestyle='--', markersize=markersize, markevery=markevery,
-    label='MOG (est, $\\beta_t$)', color=color_mog_est, linewidth=linewidth
-)
+# # Plot DPS (Exp E) closed-form likelihood score injection (no SNR matching, full T)
+# plt.semilogy(
+#     snr, nmse_fog_cf_e_fullT,
+#     marker='D', markersize=markersize, markevery=markevery,
+#     linestyle='--',
+#     label='FOG (closed-form, full T)', color=color_fog_cf, linewidth=linewidth, alpha=0.9
+# )
+
+# # Plot DPS-COV with oracle covariance, using beta_t scaling
+# plt.semilogy(
+#     snr, nmse_mog_oracle_beta,
+#     marker='s', linestyle='--', markersize=markersize, markevery=markevery,
+#     label='MOG (oracle, $\\beta_t$)', color=color_mog_oracle, linewidth=linewidth
+# )
+
+# # Plot DPS-COV with estimated covariance, using beta_t scaling
+# plt.semilogy(
+#     snr, nmse_mog_est_beta,
+#     marker='^', linestyle='--', markersize=markersize, markevery=markevery,
+#     label='MOG (est, $\\beta_t$)', color=color_mog_est, linewidth=linewidth
+# )
 
 # Plot DPS-COV with oracle covariance, using sqrt(beta_t) scaling
 plt.semilogy(
     snr, nmse_mog_oracle_sqrtbeta,
     marker='^', linestyle='-', markersize=markersize, markevery=markevery,
-    label='MOG (oracle, $\\sqrt{\\beta_t}$)', color=color_mog_oracle, linewidth=linewidth
+    label='MOG (oracle)', color=color_mog_oracle, linewidth=linewidth
 )
 
 # Plot DPS-COV with estimated covariance, using sqrt(beta_t) scaling
 plt.semilogy(
     snr, nmse_mog_est_sqrtbeta,
     marker='v', linestyle='-', markersize=markersize, markevery=markevery,
-    label='MOG (est, $\\sqrt{\\beta_t}$)', color=color_mog_est, linewidth=linewidth
+    label='MOG (est)', color=color_mog_est, linewidth=linewidth
 )
 
 # Plot LMMSE (genie-aided, upper bound)
@@ -201,15 +223,15 @@ plt.semilogy(
     label='LMMSE', color=color_lmmse, linewidth=linewidth
 )
 
-# Add annotation for line style meaning (with better styling)
-plt.text(
-    0.02, 0.02,
-    r'Solid: $\sqrt{\beta_t}$   Dashed: $\beta_t$',
-    transform=plt.gca().transAxes,
-    fontsize=11,
-    verticalalignment='bottom',
-    bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8, edgecolor='gray', linewidth=1)
-)
+# # Add annotation for line style meaning (with better styling)
+# plt.text(
+#     0.02, 0.02,
+#     r'Solid: $\sqrt{\beta_t}$   Dashed: $\beta_t$',
+#     transform=plt.gca().transAxes,
+#     fontsize=11,
+#     verticalalignment='bottom',
+#     bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8, edgecolor='gray', linewidth=1)
+# )
 
 # Formatting
 plt.xlim([-15, 5])

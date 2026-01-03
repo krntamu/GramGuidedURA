@@ -128,6 +128,33 @@ Controls how `zeta_t` is computed:
 - Low SNR: `constant` or `sqrt_beta_t`
 - Medium to high SNR: `sqrt_beta_t` or `beta_t`
 
+#### Optional: `--cov_beta_power` (Continuous Beta Power Override)
+
+If you want a *continuous* knob instead of switching modes, you can override `zeta_t` with:
+
+\[
+zeta_t = \beta_t^p
+\]
+
+- `p=1.0` ≈ `beta_t`
+- `p=0.5` ≈ `sqrt_beta_t`
+- `p=0.0` ≈ `constant`
+- `p=-0.5` ≈ `snr_aware`-like
+
+If `--cov_beta_power` is set, it overrides `--cov_scale_mode`.
+
+#### Optional: `--cov_clip_mode` (Clipping Mode for Cov Guidance)
+
+The cov guidance can be clipped in two different ways:
+
+- `auto` (default): backward-compatible behavior
+  - element-wise clip for the legacy `beta_t` path
+  - norm-based clip otherwise
+- `elementwise`: clamp each element of the cov correction to \([-C, C]\)
+- `norm`: scale the whole correction so its L2 norm is \(\le C\) (preserves direction)
+
+When you are sweeping `--cov_beta_power`, it can be useful to **fix `--cov_clip_mode`** so the sweep reflects only the scaling operator, not a change in clipping behavior.
+
 ### 2. `--cov_grad_norm` (Gradient Normalization)
 
 Controls gradient normalization method:

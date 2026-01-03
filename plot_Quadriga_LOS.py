@@ -183,28 +183,28 @@ plt.semilogy(
     label='FOG', color=color_fog, linewidth=linewidth
 )
 
-# Plot DPS-COV with oracle covariance, using beta_t scaling
-plt.semilogy(
-    snr, nmse_mog_oracle_beta,
-    marker='s', linestyle='--', markersize=markersize, markevery=markevery,
-    color=color_mog_oracle, linewidth=linewidth,
-    label='MOG (oracle, $\\beta_t$)'
-)
+# # Plot DPS-COV with oracle covariance, using beta_t scaling
+# plt.semilogy(
+#     snr, nmse_mog_oracle_beta,
+#     marker='s', linestyle='--', markersize=markersize, markevery=markevery,
+#     color=color_mog_oracle, linewidth=linewidth,
+#     label='MOG (oracle, $\\beta_t$)'
+# )
 
-# Plot DPS-COV with estimated covariance, using beta_t scaling
-plt.semilogy(
-    snr, nmse_mog_est_beta,
-    marker='^', linestyle='--', markersize=markersize, markevery=markevery,
-    color=color_mog_est, linewidth=linewidth,
-    label='MOG (est, $\\beta_t$)'
-)
+# # Plot DPS-COV with estimated covariance, using beta_t scaling
+# plt.semilogy(
+#     snr, nmse_mog_est_beta,
+#     marker='^', linestyle='--', markersize=markersize, markevery=markevery,
+#     color=color_mog_est, linewidth=linewidth,
+#     label='MOG (est, $\\beta_t$)'
+# )
 
 # Plot DPS-COV with oracle covariance, using sqrt(beta_t) scaling
 plt.semilogy(
     snr, nmse_mog_oracle_sqrtbeta,
     marker='^', linestyle='-', markersize=markersize, markevery=markevery,
     color=color_mog_oracle, linewidth=linewidth,
-    label='MOG (oracle, $\\sqrt{\\beta_t}$)'
+    label='MOG (oracle)'
 )
 
 # Plot DPS-COV with estimated covariance, using sqrt(beta_t) scaling
@@ -212,18 +212,18 @@ plt.semilogy(
     snr, nmse_mog_est_sqrtbeta,
     marker='d', linestyle='-', markersize=markersize, markevery=markevery,
     color=color_mog_est, linewidth=linewidth,
-    label='MOG (est, $\\sqrt{\\beta_t}$)'
+    label='MOG (est)'
 )
 
-# Add annotation for line style meaning (with better styling)
-plt.text(
-    0.02, 0.02,
-    r'Solid: $\sqrt{\beta_t}$   Dashed: $\beta_t$',
-    transform=plt.gca().transAxes,
-    fontsize=11,
-    verticalalignment='bottom',
-    bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8, edgecolor='gray', linewidth=1)
-)
+# # Add annotation for line style meaning (with better styling)
+# plt.text(
+#     0.02, 0.02,
+#     r'Solid: $\sqrt{\beta_t}$   Dashed: $\beta_t$',
+#     transform=plt.gca().transAxes,
+#     fontsize=11,
+#     verticalalignment='bottom',
+#     bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8, edgecolor='gray', linewidth=1)
+# )
 
 # Formatting
 plt.xlim([-15, 5])
