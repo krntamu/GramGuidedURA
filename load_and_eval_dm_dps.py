@@ -365,7 +365,10 @@ def build_tester(model: DMCE.DiffusionModel,
         criteria=['nmse'],
         complex_data=False,
         return_all_timesteps=return_all_timesteps,
-        fft_pre=True,
+        # IMPORTANT: spatial-first pipeline
+        # - keep the dataloader in the spatial domain
+        # - we will FFT inside the evaluation loop right before calling the DM/DPS sampler
+        fft_pre=False,
         mode=mode,
         use_dps=True,
         dps_lambda=dps_lambda,
@@ -1156,7 +1159,15 @@ def main() -> None:
                 for batch_idx, data_batch in enumerate(tester.dataloader):
                     try:
                         data_batch = data_batch.to(device=tester.device)
-                        y = functional.awgn(data_batch, snr, multiplier=tester.model.noise_multiplier)
+                        # ------------------------------------------------------------------
+                        # Spatial-first pipeline:
+                        #   1) Generate spatial-domain observation y_sp
+                        #   2) Estimate cov/Gram in spatial domain
+                        #   3) FFT to angular domain for diffusion/DPS sampling
+                        #   4) IFFT back to spatial domain for final NMSE
+                        # ------------------------------------------------------------------
+                        data_sp = data_batch
+                        y_sp = functional.awgn(data_sp, snr, multiplier=tester.model.noise_multiplier)
 
                         # --------------------------------------------------------------
                         # Per-batch debug toggles (only for the first batch)
@@ -1192,18 +1203,22 @@ def main() -> None:
                         # Build covariance term depending on selected method.
                         # ------------------------------------------------------------------
                         if args.method in ('dps', 'dps_cov_oracle'):
-                            # Oracle covariance R_h = H H^H via X X^H
-                            cov = generate_cov_batch(data_batch)
+                            # Oracle covariance in SPATIAL domain: R_h = H H^H
+                            cov_sp = generate_cov_batch(data_sp)
                         elif args.method == 'dps_cov_est':
-                            # Time-averaged covariance estimate from Y_d = H X_d + N
-                            cov = estimate_cov_time_averaged_batch(
-                                data_batch,
+                            # Time-averaged covariance estimate (SPATIAL domain) from Y_d = H X_d + N
+                            cov_sp = estimate_cov_time_averaged_batch(
+                                data_sp,
                                 snr_db=float(snr_db),
                                 n_time_samples=args.n_time_samples,
                                 modulation=args.modulation,
                             )
                         else:
                             raise ValueError(f"Unknown DPS method: {args.method}")
+
+                        # Transform y and covariance to ANGULAR domain for diffusion sampling
+                        y_ang = ut.complex_1d_fft(y_sp, ifft=False, mode=tester.mode)
+                        cov_ang = ut.cov_spatial_to_angular(cov_sp)
 
                         if tester.use_dps:
                             # Create diagnostic recorder if enabled
@@ -1219,8 +1234,8 @@ def main() -> None:
                                 snr_for_loop = snr
                             
                             x_est = dps_sampler.generate_posterior_sample(
-                                y.to(device=tester.device),
-                                cov=cov.to(device=tester.device),
+                                y_ang.to(device=tester.device),
+                                cov=cov_ang.to(device=tester.device),
                                 return_all_timesteps=tester.return_all_timesteps,
                                 num_steps=args.num_steps,
                                 snr=snr_for_loop,  # Pass None for ablation to use full T
@@ -1229,14 +1244,14 @@ def main() -> None:
                             )
                             
                             # NMSE FFT invariance diagnostic tests (optional, only if --run_fft_diagnostics is set)
-                            if args.run_fft_diagnostics and batch_idx == 0 and snr_idx == 0 and tester.fft_pre and not tester.return_all_timesteps:
+                            if args.run_fft_diagnostics and batch_idx == 0 and snr_idx == 0 and not tester.return_all_timesteps:
                                 if not FFT_DIAGNOSTICS_AVAILABLE:
                                     print("\n[WARNING] FFT diagnostics requested but fft_diagnostics module not available.")
                                     print("  Skipping FFT diagnostics. Please ensure fft_diagnostics.py exists.")
                                 else:
                                     # Run basic diagnostics
                                     run_nmse_fft_diagnostics(
-                                        data_batch=data_batch,
+                                        data_batch=data_sp,
                                         mode=tester.mode,
                                         verbose=True,
                                     )
@@ -1244,8 +1259,8 @@ def main() -> None:
                                     # Run corrected NMSE FFT invariance diagnostic
                                     # Uses the same ground truth and estimate tensors in both domains
                                     run_end_to_end_invariance_audit(
-                                        H_gt_ang=data_batch,  # Angular domain ground truth
-                                        H_hat_ang=x_est,      # Angular domain estimate
+                                        H_gt_ang=ut.complex_1d_fft(data_sp, ifft=False, mode=tester.mode),  # Angular GT
+                                        H_hat_ang=x_est,      # Angular estimate (sampler output)
                                         mode=tester.mode,
                                         verbose=True,
                                         debug=args.fft_diagnostics_debug,  # Enable debug prints if requested
@@ -1271,11 +1286,11 @@ def main() -> None:
                                 return_all_timesteps=tester.return_all_timesteps,
                             )
                         
-                        if tester.fft_pre:
-                            if tester.return_all_timesteps:
-                                x_est = ut.complex_1d_fft(x_est, ifft=True, mode=tester.mode, _4d_array=True)
-                            else:
-                                x_est = ut.complex_1d_fft(x_est, ifft=True, mode=tester.mode)
+                        # Map estimate back to SPATIAL domain for NMSE
+                        if tester.return_all_timesteps:
+                            x_est = ut.complex_1d_fft(x_est, ifft=True, mode=tester.mode, _4d_array=True)
+                        else:
+                            x_est = ut.complex_1d_fft(x_est, ifft=True, mode=tester.mode)
                         
                         x_hat.append(x_est)
                         

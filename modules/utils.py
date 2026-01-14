@@ -326,3 +326,75 @@ def complex_1d_fft(input_tensor, ifft=False, _4d_array=False, mode='1D', debug=F
         print(f"      Final output shape: {fft_result.shape}")
 
     return fft_result
+
+
+# ============================================================================
+# Covariance (Gram) domain transforms
+# ============================================================================
+
+def _ri_to_complex(x_ri: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a real/imag stacked tensor to a complex tensor.
+
+    Expected input formats used in this repo:
+      - (B, 2, ..., ...) where channel 0 is real, channel 1 is imag.
+    """
+    if x_ri.dim() < 3 or x_ri.size(1) != 2:
+        raise ValueError(f"Expected x_ri with shape (B, 2, ...), got {tuple(x_ri.shape)}")
+    return torch.complex(x_ri[:, 0], x_ri[:, 1])
+
+
+def _complex_to_ri(x_c: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a complex tensor to a real/imag stacked tensor (B, 2, ...).
+    """
+    return torch.stack((x_c.real, x_c.imag), dim=1)
+
+
+def cov_spatial_to_angular(cov_ri: torch.Tensor) -> torch.Tensor:
+    """
+    Transform a spatial-domain Gram/covariance matrix to the angular domain.
+
+    For channel matrices transformed as:
+        H_ang = F_rx H_sp (and potentially also a TX transform),
+    the RX-side Gram transforms as:
+        R_ang = H_ang H_ang^H = F_rx (H_sp H_sp^H) F_rx^H = F_rx R_sp F_rx^H.
+
+    Implementation detail:
+      - Left-multiply by F_rx  -> unitary FFT along the row dimension.
+      - Right-multiply by F_rx^H -> unitary IFFT along the column dimension.
+
+    Parameters
+    ----------
+    cov_ri : torch.Tensor
+        Real/imag tensor of shape (B, 2, N_R, N_R).
+
+    Returns
+    -------
+    torch.Tensor
+        Angular-domain covariance in the same real/imag format, shape (B, 2, N_R, N_R).
+    """
+    if cov_ri.dim() != 4 or cov_ri.size(1) != 2 or cov_ri.size(-1) != cov_ri.size(-2):
+        raise ValueError(f"Expected cov_ri with shape (B, 2, N, N), got {tuple(cov_ri.shape)}")
+
+    R = _ri_to_complex(cov_ri)  # (B, N, N)
+    # F * R
+    R = torch.fft.fft(R, dim=-2, norm="ortho")
+    # (F * R) * F^H
+    R = torch.fft.ifft(R, dim=-1, norm="ortho")
+    return _complex_to_ri(R)
+
+
+def cov_angular_to_spatial(cov_ri: torch.Tensor) -> torch.Tensor:
+    """
+    Inverse of cov_spatial_to_angular(): R_sp = F_rx^H R_ang F_rx.
+    """
+    if cov_ri.dim() != 4 or cov_ri.size(1) != 2 or cov_ri.size(-1) != cov_ri.size(-2):
+        raise ValueError(f"Expected cov_ri with shape (B, 2, N, N), got {tuple(cov_ri.shape)}")
+
+    R = _ri_to_complex(cov_ri)  # (B, N, N)
+    # F^H * R
+    R = torch.fft.ifft(R, dim=-2, norm="ortho")
+    # (F^H * R) * F
+    R = torch.fft.fft(R, dim=-1, norm="ortho")
+    return _complex_to_ri(R)

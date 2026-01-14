@@ -287,6 +287,10 @@ python load_and_eval_dm_dps.py \
 python load_and_eval_dm_dps.py \
     --ch_type quadriga_LOS \
     --method dps_cov_oracle \
+    --exp_key H \
+    --like_snr_gate \
+    --like_snr0_db -10.5 \
+    --like_snr_delta_db 2.0 \
     --cov_lambda 0.0005 \
     --cov_scale_mode sqrt_beta_t \
     --cov_grad_norm none \
@@ -294,6 +298,11 @@ python load_and_eval_dm_dps.py \
     --cov_step_clip 2.0 \
     --dps_lambda 0.3
 ```
+
+**Important (Quadriga LOS)**:
+- For `quadriga_LOS`, the **final headline results should be reported with EXP H + sigmoid-gated likelihood** enabled
+  (`--exp_key H --like_snr_gate`). This stabilizes likelihood guidance across the SNR sweep and avoids over-updating
+  in regimes where the observation SNR makes the raw likelihood term too aggressive.
 
 **Parameter Explanation:**
 - `--cov_lambda 0.01`: Moderate covariance guidance strength
@@ -333,6 +342,9 @@ Quadriga LOS variant (same setup; only `--dps_lambda` changes):
 python load_and_eval_dm_dps.py \
     --method dps \
     --exp_key H \
+    --like_snr_gate \
+    --like_snr0_db -10.5 \
+    --like_snr_delta_db 2.0 \
     --dps_lambda 0.3 \
     --ch_type quadriga_LOS
 ```

@@ -127,10 +127,14 @@ The FFT invariance diagnostic module (`fft_diagnostics.py`) verifies that NMSE (
 
 ### Why This Matters
 
-In the DPS-COV pipeline:
-1. **Training/Inference**: Channels are transformed to frequency domain using FFT (`fft_pre=True`)
-2. **Evaluation**: Estimates are transformed back to spatial domain using IFFT for NMSE computation
-3. **Requirement**: Since FFT/IFFT is a unitary transformation, NMSE should be identical in both domains (up to numerical precision)
+In the DPS-COV pipeline (spatial-first, paper-faithful execution):
+1. **Spatial-domain observation & side-info**: Generate \(\mathbf{Y}\) and estimate Gram/covariance in the **spatial** domain.
+2. **Angular-domain diffusion**: Apply a unitary FFT to map to the **angular** domain and run DM/DPS sampling there.
+3. **Spatial-domain evaluation**: Apply IFFT to map the estimate back to the **spatial** domain and compute final NMSE.
+
+Note:
+- This avoids “domain-mixed” covariance estimation (i.e., estimating Gram in the already-FFT’ed domain by construction).
+- FFT/IFFT is unitary, so NMSE is invariant *if computed consistently* (up to numerical precision), but intermediate estimators (e.g., sample Gram estimates) are now explicitly computed in the spatial domain to match Algorithm~1.
 
 If NMSE differs significantly between angular and spatial domains, it indicates:
 - FFT/IFFT normalization issues
