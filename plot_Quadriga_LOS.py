@@ -101,30 +101,50 @@ nmse_mog_oracle_sqrtbeta = np.array([
     0.047362495,
     0.042795561
 ])
-
 # SOG: DPS-COV with oracle covariance, using sqrt(beta_t) scaling (alternative)
-nmse_sog = np.array([
-    0.219811067,
-    0.19705236,
-    0.179879472,
-    0.165927768,
-    0.153186992,
-    0.143654242,
-    0.135986388,
-    0.129242808,
-    0.123257726,
-    0.118758313,
-    0.114668503,
-    0.11050991,
-    0.105952352,
-    0.099880569,
-    0.094165929,
-    0.08781185,
-    0.080954589,
-    0.073548339,
-    0.06811215,
-    0.060045335,
-    0.054383531
+# Gram only 
+mean_gram = np.array([
+    1.748635e-01, 1.538816e-01, 1.387912e-01, 1.285072e-01, 1.205567e-01,
+    1.153305e-01, 1.111535e-01, 1.070588e-01, 1.037800e-01, 1.005809e-01,
+    9.726343e-02, 9.411472e-02, 9.060667e-02, 8.586457e-02, 8.137912e-02,
+    7.657793e-02, 7.111976e-02, 6.517617e-02, 6.066789e-02, 5.418116e-02,
+    4.941193e-02
+])
+
+# # Gram + naive likelihood
+# mean_naive = np.array([
+#     1.810029e-01, 1.575632e-01, 1.403509e-01, 1.293232e-01, 1.202357e-01,
+#     1.139285e-01, 1.086584e-01, 1.044182e-01, 9.993476e-02, 9.589358e-02,
+#     9.166604e-02, 8.727502e-02, 8.239515e-02, 7.671840e-02, 7.097632e-02,
+#     6.502634e-02, 5.925589e-02, 5.369763e-02, 4.877206e-02, 4.397259e-02,
+#     3.956686e-02
+# ])
+
+# Gram + gated likelihood
+mean_gated = np.array([
+    1.764893e-01, 1.529106e-01, 1.383094e-01, 1.280172e-01, 1.203346e-01,
+    1.143455e-01, 1.093437e-01, 1.048839e-01, 1.006874e-01, 9.638820e-02,
+    9.208596e-02, 8.760896e-02, 8.263041e-02, 7.669161e-02, 7.099428e-02,
+    6.529442e-02, 5.927842e-02, 5.366533e-02, 4.882218e-02, 4.388248e-02,
+    3.951930e-02
+])
+
+# Gram + gated likelihood (estimated / new results)
+mean_gated_est = np.array([
+    1.759127e-01, 1.538754e-01, 1.392316e-01, 1.280777e-01, 1.205633e-01,
+    1.145857e-01, 1.096064e-01, 1.048951e-01, 1.004672e-01, 9.649553e-02,
+    9.214246e-02, 8.755556e-02, 8.261013e-02, 7.682554e-02, 7.120566e-02,
+    6.516127e-02, 5.936537e-02, 5.382114e-02, 4.885961e-02, 4.394368e-02,
+    3.962712e-02
+])
+
+# Likelihood only (Exp H) — from terminal output, SNR -15..5 step 1
+nmse_like_only_exp_h = np.array([
+    3.120825e-01, 2.637613e-01, 2.285920e-01, 2.030980e-01, 1.810158e-01,
+    1.627318e-01, 1.495765e-01, 1.386342e-01, 1.309456e-01, 1.229533e-01,
+    1.156248e-01, 1.082929e-01, 1.007664e-01, 9.259009e-02, 8.497594e-02,
+    7.772791e-02, 7.067811e-02, 6.403799e-02, 5.759114e-02, 5.179929e-02,
+    4.622400e-02
 ])
 
 # MOG_EST_SQRTBETA: DPS-COV with estimated covariance, using sqrt(beta_t) scaling
@@ -161,6 +181,7 @@ plt.figure(figsize=(8.0, 5.5))
 # Define colors for consistent styling (using more distinct colors)
 color_dm = '#1f77b4'          # Blue
 color_fog = '#ff7f0e'         # Orange
+color_fog_cf = '#17becf'      # Cyan (match plot_3GPP_NLOS.py "Likelihood only")
 color_mog_oracle = '#2ca02c'  # Green
 color_mog_est = '#d62728'     # Red
 
@@ -176,11 +197,11 @@ plt.semilogy(
     label='DM', color=color_dm, linewidth=linewidth
 )
 
-# Plot DPS (FOG: First-Order Guidance) with lambda=0.3
+# Plot DPS (SOG: Second-Order Guidance)
 plt.semilogy(
-    snr, nmse_fog,
+    snr, mean_gram,
     marker='s', markersize=markersize, markevery=markevery,
-    label='FOG', color=color_fog, linewidth=linewidth
+    label='GRAM only', color=color_fog, linewidth=linewidth
 )
 
 # # Plot DPS-COV with oracle covariance, using beta_t scaling
@@ -201,19 +222,34 @@ plt.semilogy(
 
 # Plot DPS-COV with oracle covariance, using sqrt(beta_t) scaling
 plt.semilogy(
-    snr, nmse_mog_oracle_sqrtbeta,
+    snr, mean_gated,
     marker='^', linestyle='-', markersize=markersize, markevery=markevery,
     color=color_mog_oracle, linewidth=linewidth,
-    label='MOG (oracle)'
+    label='GRAM + Likelihood (oracle)'
 )
 
-# Plot DPS-COV with estimated covariance, using sqrt(beta_t) scaling
 plt.semilogy(
-    snr, nmse_mog_est_sqrtbeta,
+    snr, mean_gated_est,
     marker='d', linestyle='-', markersize=markersize, markevery=markevery,
     color=color_mog_est, linewidth=linewidth,
-    label='MOG (est)'
+    label='GRAM + Likelihood (est)'
 )
+
+# Likelihood only (Exp H)
+plt.semilogy(
+    snr, nmse_like_only_exp_h,
+    marker='o', linestyle='--', markersize=markersize, markevery=markevery,
+    color=color_fog_cf, linewidth=linewidth, alpha=0.95,
+    label='Likelihood only'
+)
+
+# # Plot DPS-COV with estimated covariance, using sqrt(beta_t) scaling
+# plt.semilogy(
+#     snr, mean_gated_est,
+#     marker='d', linestyle='-', markersize=markersize, markevery=markevery,
+#     color=color_mog_est, linewidth=linewidth,
+#     label='GRAM + Likelihood (est)'
+# )
 
 # # Add annotation for line style meaning (with better styling)
 # plt.text(

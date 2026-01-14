@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--sigma_y2', type=float, default=1.0, help='AWGN variance used in likelihood')
     parser.add_argument(
+        '--use_fixed_sigma_y2',
+        action='store_true',
+        help='Use a fixed --sigma_y2 for likelihood (and closed-form variants) instead of computing sigma_y2 from SNR. '
+             'Default: disabled (sigma_y2 is derived from SNR and the model noise_multiplier to match functional.awgn).',
+    )
+    parser.add_argument(
         '--num_steps',
         type=int,
         default=None,
@@ -152,6 +158,13 @@ def parse_args() -> argparse.Namespace:
         help='Use sanity check SNR range: [-15, -10, -5, 0, 5] instead of full range.',
     )
     parser.add_argument(
+        '--single_snr_db',
+        type=float,
+        default=None,
+        help='If set, evaluate only this single SNR point (in dB), e.g. --single_snr_db -15. '
+             'This overrides --sanity_snrs and the default full sweep.',
+    )
+    parser.add_argument(
         '--record_diagnostics',
         action='store_true',
         help='Record diagnostic metrics (c_t/b_t, clip_rate) for each SNR point.',
@@ -170,8 +183,26 @@ def parse_args() -> argparse.Namespace:
         '--exp_key',
         type=str,
         default='A',
-        choices=['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G'],
-        help='Ablation experiment key: A=baseline (current), B=scalar Jacobian (1/sqrt(alpha_bar_t)), C=autograd gold gradient, D=soft-gated (beta_t * alpha_bar_t^(gamma-1/2)), E=closed-form likelihood (score injection), Eprime=diagnostic closed-form post-add (sigma_t^2 scaling), F=paper-style reverse optimization update, G=paper Algorithm-3 style (DDIM step + posterior correction)',
+        choices=['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G', 'H'],
+        help='Ablation experiment key: A=baseline (current), B=scalar Jacobian (1/sqrt(alpha_bar_t)), C=autograd gold gradient, D=soft-gated (beta_t * alpha_bar_t^(gamma-1/2)), E=closed-form likelihood (score injection), Eprime=diagnostic closed-form post-add (sigma_t^2 scaling), F=paper-style reverse optimization update, G=paper Algorithm-3 style (DDIM step + posterior correction), H=classic DPS likelihood: x0_hat(H_t) from prior score then grad_like≈(y-x0_hat)/sigma_y2',
+    )
+    parser.add_argument(
+        '--like_snr_gate',
+        action='store_true',
+        help='EXP H only: enable sigmoid SNR(dB) gate on likelihood strength: '
+             'w_like = dps_lambda * beta_t * gate(SNR_dB), gate = 1/(1+exp(-(SNR_dB-SNR0)/Delta)).',
+    )
+    parser.add_argument(
+        '--like_snr0_db',
+        type=float,
+        default=-10.5,
+        help='EXP H only: SNR0 (dB) midpoint for the sigmoid gate. Default: -10.5.',
+    )
+    parser.add_argument(
+        '--like_snr_delta_db',
+        type=float,
+        default=2.0,
+        help='EXP H only: Delta (dB) smoothness for the sigmoid gate. Default: 2.0.',
     )
     parser.add_argument(
         '--gamma',
@@ -932,8 +963,10 @@ def main() -> None:
 
     diffusion_model.reverse_add_random = args.reverse_add_random
     
-    # SNR range: -15 to 5 dB, step 1 (or custom range for sanity check)
-    if args.sanity_snrs:
+    # SNR range: -15 to 5 dB, step 1 (or custom range for sanity check / single point)
+    if args.single_snr_db is not None:
+        target_snrs = [float(args.single_snr_db)]
+    elif args.sanity_snrs:
         target_snrs = [-15, -10, -5, 0, 5]
     else:
         target_snrs = list(range(-15, 6, 1))
@@ -951,6 +984,10 @@ def main() -> None:
         print(f"Cov lambda: {args.cov_lambda}")
         print(f"Cov step clip: {args.cov_step_clip}")
         print(f"Cov clip mode: {args.cov_clip_mode}")
+    if args.use_fixed_sigma_y2:
+        print(f"Likelihood sigma_y2: FIXED ({args.sigma_y2})")
+    else:
+        print("Likelihood sigma_y2: SNR-derived (matches functional.awgn)")
         if args.use_t_start_scaling:
             print(f"Per-step scaling: ENABLED (cov_lambda_eff(t) = cov_lambda_base * sqrt(beta[t]) for each step)")
     if args.num_steps is None:
@@ -1051,6 +1088,10 @@ def main() -> None:
                     # but args.cov_lambda is still printed elsewhere for reproducibility of settings.
                     print(f"\n[SNR {snr_db:.1f} dB] Processing with DPS (lambda={tester.dps_lambda:.3f}, "
                           f"method={args.method}, cov_lambda={args.cov_lambda})...")
+                    if args.exp_key == 'H' and args.like_snr_gate:
+                        import math
+                        gate = 1.0 / (1.0 + math.exp(-((float(snr_db) - float(args.like_snr0_db)) / float(args.like_snr_delta_db))))
+                        print(f"  [EXP H] like_snr_gate: SNR_dB={snr_db:.1f}, SNR0={args.like_snr0_db:.2f}, Delta={args.like_snr_delta_db:.2f} -> gate={gate:.6f}")
                 else:
                     print(f"\n[SNR {snr_db:.1f} dB] Processing baseline...")
                 
@@ -1059,7 +1100,8 @@ def main() -> None:
                     rho = float(snr)
                     noise_mult = float(tester.model.noise_multiplier)
                     sigma_y2_snr = (noise_mult ** 2) / rho
-                    likelihood_grad_fn = make_awgn_likelihood_grad(sigma_y2_snr)
+                    sigma_y2_like = float(args.sigma_y2) if args.use_fixed_sigma_y2 else float(sigma_y2_snr)
+                    likelihood_grad_fn = make_awgn_likelihood_grad(sigma_y2_like)
 
                     # Select covariance guidance strength based on method
                     if args.method == 'dps':
@@ -1077,7 +1119,7 @@ def main() -> None:
                         cov_grad_norm=args.cov_grad_norm,
                         cov_step_clip=args.cov_step_clip,
                         cov_clip_mode=args.cov_clip_mode,
-                        sigma_y2=sigma_y2_snr,
+                        sigma_y2=sigma_y2_like,
                         add_random=False,
                         exp_key=args.exp_key,
                         gamma=args.gamma,
@@ -1089,6 +1131,9 @@ def main() -> None:
                         lw_k=args.lw_k,
                         g_tau1=args.g_tau1,
                         like_beta_power=args.like_beta_power,
+                        like_snr_gate=bool(args.like_snr_gate),
+                        like_snr0_db=float(args.like_snr0_db),
+                        like_snr_delta_db=float(args.like_snr_delta_db),
                     )
                     # Enable t_start-based scaling if requested
                     if args.use_t_start_scaling:
@@ -1179,6 +1224,7 @@ def main() -> None:
                                 return_all_timesteps=tester.return_all_timesteps,
                                 num_steps=args.num_steps,
                                 snr=snr_for_loop,  # Pass None for ablation to use full T
+                                obs_snr_db=float(snr_db),
                                 diagnostic_recorder=diagnostic_recorder,
                             )
                             

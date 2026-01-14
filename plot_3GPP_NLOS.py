@@ -49,6 +49,26 @@ nmse_dm = np.array([
     0.067043602
 ])
 
+# CME-IS baseline (empirical-prior CME via IS over deltas; knn proposal; n_eval=200; alpha=0.7)
+# NOTE: Only computed at a subset of SNRs; missing SNR points are NaN and will be skipped in plotting.
+# Source: terminal runs of cme_baseline_3gpp_is.py (proposal=knn, pool_size=min(120000, n_train)=100000, K=512, refine_steps=1).
+nmse_cme_is = np.full_like(snr, np.nan, dtype=float)
+_cme_is_points = {
+    -15.0: 8.5324e-01,
+    -13.0: 7.1445e-01,
+    -11.0: 5.7753e-01,
+    -10.0: 5.2179e-01,
+    -9.0:  4.7881e-01,
+    -7.0:  3.7813e-01,
+    -5.0:  3.0617e-01,
+    -3.0:  2.3403e-01,
+     0.0:  1.5444e-01,
+     5.0:  6.6497e-02,
+}
+for _snr_db, _nmse in _cme_is_points.items():
+    _idx = int(np.where(snr == _snr_db)[0][0])
+    nmse_cme_is[_idx] = _nmse
+
 # FOG: DPS (First-Order Guidance) with lambda=0.1
 nmse_fog = np.array([
     0.953405201, 0.923455656, 0.883167565, 0.831169307, 0.767774642,
@@ -130,6 +150,47 @@ nmse_mog_est_sqrtbeta = np.array([
     0.039299436
 ])
 
+# -----------------------------------------------------------------------------
+# Exp H (GRAM + Likelihood) results (from terminal output, SNR -15..5 step 1)
+# -----------------------------------------------------------------------------
+# GRAM only (Exp H, likelihood off / baseline for this ablation)
+nmse_gram_only_exp_h = np.array([
+    7.998869e-01, 7.224673e-01, 6.470816e-01, 5.771204e-01, 5.121256e-01,
+    4.515603e-01, 3.962944e-01, 3.437672e-01, 2.971370e-01, 2.554634e-01,
+    2.186876e-01, 1.864926e-01, 1.583882e-01, 1.333226e-01, 1.125727e-01,
+    9.487968e-02, 7.938926e-02, 6.656365e-02, 5.602067e-02, 4.675360e-02,
+    3.917487e-02
+], dtype=float)
+
+# GRAM + Likelihood (oracle)
+nmse_gram_like_oracle_exp_h = np.array([
+    7.991148e-01, 7.217503e-01, 6.479988e-01, 5.772156e-01, 5.121858e-01,
+    4.507651e-01, 3.942465e-01, 3.425176e-01, 2.951238e-01, 2.532761e-01,
+    2.170824e-01, 1.842092e-01, 1.562552e-01, 1.317736e-01, 1.111409e-01,
+    9.336518e-02, 7.842468e-02, 6.561569e-02, 5.512220e-02, 4.600573e-02,
+    3.846021e-02
+], dtype=float)
+
+# GRAM + Likelihood (est)
+nmse_gram_like_est_exp_h = np.array([
+    8.046212e-01, 7.268641e-01, 6.512193e-01, 5.809162e-01, 5.137955e-01,
+    4.520712e-01, 3.944145e-01, 3.428931e-01, 2.966368e-01, 2.543182e-01,
+    2.176813e-01, 1.852136e-01, 1.575337e-01, 1.325100e-01, 1.118462e-01,
+    9.405626e-02, 7.904492e-02, 6.623647e-02, 5.558591e-02, 4.664312e-02,
+    3.911159e-02
+], dtype=float)
+
+# Likelihood only (Exp H) — from terminal output, SNR -15..5 step 1
+nmse_like_only_exp_h = np.array([
+    9.525881e-01, 9.248568e-01, 8.880149e-01, 8.341098e-01, 7.732138e-01,
+    7.018799e-01, 6.236374e-01, 5.442631e-01, 4.674852e-01, 3.998596e-01,
+    3.414079e-01, 2.907076e-01, 2.473322e-01, 2.094728e-01, 1.783003e-01,
+    1.516210e-01, 1.287495e-01, 1.088099e-01, 9.236980e-02, 7.785374e-02,
+    6.560829e-02
+], dtype=float)
+
+
+
 # LMMSE: Linear Minimum Mean Square Error (genie-aided, upper bound)
 nmse_lmmse_genie = np.array([
     0.654871892, 0.614210594, 0.571697074, 0.528890459, 0.485627649,
@@ -152,6 +213,7 @@ color_fog_cf = '#17becf'      # Cyan
 color_mog_oracle = '#2ca02c'  # Green
 color_mog_est = '#d62728'     # Red
 color_lmmse = '#9467bd'       # Purple
+color_cme = '#8c564b'         # Brown
 
 # Line width and marker settings
 linewidth = 2.0
@@ -165,20 +227,28 @@ plt.semilogy(
     label='DM', color=color_dm, linewidth=linewidth
 )
 
-# Plot DPS (First-Order Guidance) with lambda=0.1
+# Plot CME-IS (only where computed)
+_mask_cme = np.isfinite(nmse_cme_is)
 plt.semilogy(
-    snr, nmse_fog,
-    marker='s', markersize=markersize, markevery=markevery,
-    label='FOG', color=color_fog, linewidth=linewidth
-    # label='FOG (Tweedie)', color=color_fog, linewidth=linewidth
+    snr[_mask_cme], nmse_cme_is[_mask_cme],
+    marker='P', markersize=markersize, linestyle='-',
+    label='CME (empirical prior)', color=color_cme, linewidth=linewidth
 )
 
-# # Plot DPS (Exp E) closed-form likelihood score injection
+# # Plot DPS (First-Order Guidance) with lambda=0.1
 # plt.semilogy(
-#     snr, nmse_fog_cf_e,
-#     marker='D', markersize=markersize, markevery=markevery,
-#     label='FOG (closed-form, SNR-matched)', color=color_fog_cf, linewidth=linewidth
+#     snr, nmse_fog,
+#     marker='s', markersize=markersize, markevery=markevery,
+#     label='FOG', color=color_fog, linewidth=linewidth
+#     # label='FOG (Tweedie)', color=color_fog, linewidth=linewidth
 # )
+
+# Plot DPS (Exp E) closed-form likelihood score injection
+plt.semilogy(
+    snr, nmse_fog_cf_e,
+    marker='D', markersize=markersize, markevery=markevery,
+    label='Likelihood (closed-form)', color=color_fog_cf, linewidth=linewidth
+)
 
 # # Plot DPS (Exp E) closed-form likelihood score injection (no SNR matching, full T)
 # plt.semilogy(
@@ -202,18 +272,30 @@ plt.semilogy(
 #     label='MOG (est, $\\beta_t$)', color=color_mog_est, linewidth=linewidth
 # )
 
-# Plot DPS-COV with oracle covariance, using sqrt(beta_t) scaling
+# Plot Exp H (GRAM + Likelihood) curves
 plt.semilogy(
-    snr, nmse_mog_oracle_sqrtbeta,
-    marker='^', linestyle='-', markersize=markersize, markevery=markevery,
-    label='MOG (oracle)', color=color_mog_oracle, linewidth=linewidth
+    snr, nmse_gram_only_exp_h,
+    marker='s', linestyle='-', markersize=markersize, markevery=markevery,
+    label='GRAM only', color=color_fog, linewidth=linewidth
 )
 
-# Plot DPS-COV with estimated covariance, using sqrt(beta_t) scaling
 plt.semilogy(
-    snr, nmse_mog_est_sqrtbeta,
-    marker='v', linestyle='-', markersize=markersize, markevery=markevery,
-    label='MOG (est)', color=color_mog_est, linewidth=linewidth
+    snr, nmse_gram_like_oracle_exp_h,
+    marker='^', linestyle='-', markersize=markersize, markevery=markevery,
+    label='GRAM + Likelihood (oracle)', color=color_mog_oracle, linewidth=linewidth
+)
+
+plt.semilogy(
+    snr, nmse_gram_like_est_exp_h,
+    marker='d', linestyle='-', markersize=markersize, markevery=markevery,
+    label='GRAM + Likelihood (est)', color=color_mog_est, linewidth=linewidth
+)
+
+# Plot Likelihood only (Exp H)
+plt.semilogy(
+    snr, nmse_like_only_exp_h,
+    marker='o', linestyle='--', markersize=markersize, markevery=markevery,
+    label='Likelihood (Tweedie)', color=color_fog_cf, linewidth=linewidth, alpha=0.95
 )
 
 # Plot LMMSE (genie-aided, upper bound)

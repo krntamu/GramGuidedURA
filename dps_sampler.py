@@ -17,6 +17,7 @@ For observation model y = x + n, n ~ N(0, sigma_y^2 I):
 """
 
 from typing import Callable, Optional, Literal
+import math
 
 import torch
 from torch import Tensor
@@ -182,7 +183,7 @@ class DpsSampler(object):
         H=None,
         sigma_y2: Optional[float] = None,
         lambda_dps: Optional[float] = None,
-        exp_key: Literal['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G'] = 'A',
+        exp_key: Literal['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G', 'H'] = 'A',
         gamma: float = 1.0,
         like_weight: float = 1.0,
         lw_schedule: Literal['const', 'ramp', 'lastk'] = 'const',
@@ -192,6 +193,9 @@ class DpsSampler(object):
         lw_k: int = 0,
         g_tau1: int = 0,
         like_beta_power: float = 1.0,
+        like_snr_gate: bool = False,
+        like_snr0_db: float = -10.5,
+        like_snr_delta_db: float = 2.0,
     ) -> None:
         """
         Parameters
@@ -290,6 +294,13 @@ class DpsSampler(object):
         # Default=1.0 preserves existing behavior.
         self.like_beta_power = float(like_beta_power)
 
+        # EXP H option: sigmoid gate on likelihood strength based on observation SNR (in dB).
+        # gate(SNR_dB) = 1 / (1 + exp(-(SNR_dB - SNR0)/Delta))
+        self.like_snr_gate = bool(like_snr_gate)
+        self.like_snr0_db = float(like_snr0_db)
+        self.like_snr_delta_db = float(like_snr_delta_db)
+        self._like_gate_cached: Optional[float] = None
+
         # Extract sigma_y2 from likelihood_grad_fn closure for experiment C
         # This is needed for the autograd loss computation
         if exp_key == 'C':
@@ -326,6 +337,7 @@ class DpsSampler(object):
         - Eprime: diagnostic post-add using sigma_t^2 * score_like_cf (no beta_t)
         - F: Paper-style reverse optimization update: H_t <- H_t + post_var_t * score_post, then noise injection
         - G: Paper Algorithm-3 style: DDIM deterministic step + explicit posterior correction term
+        - H: "Classic DPS" likelihood: form x0_hat(H_t) from prior score, then use grad_like ≈ (y - x0_hat)/sigma^2 as ∇_{H_t} log p(y|H_t)
         """
         # For experiments A and B, we can use no_grad context
         # For experiment C, we need gradients enabled
@@ -660,7 +672,37 @@ class DpsSampler(object):
                     x_prior = self.dm.reverse_step(x_t, t, add_random=self.add_random)
 
                     # 2) Compute likelihood gradient at the prior estimate (not at noisy x_t)
-                    grad_like_H0 = self.likelihood_grad_fn(x_prior, y, t)
+                    if self.exp_key == 'H':
+                        # ------------------------------------------------------------
+                        # Exp H: "classic DPS" likelihood gradient in H_t-space.
+                        #
+                        # Approximate:
+                        #   ∇_{H_t} log p(y | H_t) ≈ (y - x0_hat(H_t)) / sigma_y^2
+                        # where x0_hat(H_t) is formed from the prior score:
+                        #   score_prior(H_t) = ∇_{H_t} log p(H_t)
+                        #   x0_hat = 1/sqrt(alpha_bar_t) * (H_t + (1 - alpha_bar_t) * score_prior(H_t))
+                        #
+                        # For objective='pred_noise', we use:
+                        #   score_prior ≈ -eps_hat / sqrt(1 - alpha_bar_t)
+                        # which makes x0_hat identical to the standard DDPM formula:
+                        #   x0_hat = (H_t - sqrt(1 - alpha_bar_t) * eps_hat) / sqrt(alpha_bar_t)
+                        # ------------------------------------------------------------
+                        if self.dm.objective != 'pred_noise':
+                            raise NotImplementedError("Exp H currently supports only objective='pred_noise'.")
+                        b, *_ = x_t.shape
+                        batched_times = torch.full((b,), t, device=self.dm.device, dtype=torch.long)
+                        eps_hat = self.dm.model(x_t, batched_times)
+                        a = torch.clamp(self.dm.alphas_cumprod[t].to(x_t.device), min=1e-12)
+                        shape_ones = (1,) * (x_t.ndim - 1)
+                        a_view = a.view(1, *shape_ones)
+                        one_minus_a = torch.clamp(1.0 - a_view, min=1e-12)
+                        # score_prior(H_t)
+                        score_prior = -eps_hat / torch.sqrt(one_minus_a)
+                        # x0_hat = (H_t + (1-a)*score_prior) / sqrt(a)
+                        x0_hat = (x_t + one_minus_a * score_prior) / torch.sqrt(a_view + 1e-12)
+                        grad_like_H0 = self.likelihood_grad_fn(x0_hat, y, t)
+                    else:
+                        grad_like_H0 = self.likelihood_grad_fn(x_prior, y, t)
 
                     if self.exp_key == 'A':
                         grad_like = grad_like_H0
@@ -683,8 +725,11 @@ class DpsSampler(object):
                         denom = sqrt_a * (sigma2 + (1.0 - a_view) / a_view)
                         score_like_cf = (y - (x_t / sqrt_a)) / denom
                         grad_like = score_like_cf  # treat as score-like term for diagnostic
+                    elif self.exp_key == 'H':
+                        # Use the "classic" approximate likelihood gradient in H_t-space
+                        grad_like = grad_like_H0
                     else:
-                        raise ValueError(f"Unknown exp_key: {self.exp_key}. Must be 'A', 'B', 'C', 'D', 'E', 'Eprime', 'F', or 'G'.")
+                        raise ValueError(f"Unknown exp_key: {self.exp_key}. Must be 'A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G', or 'H'.")
 
         # 3) Compute likelihood correction (post-add) for A/B/D/Eprime/C.
         # Exp E uses score injection into x_prior above, so correction is already set to 0.
@@ -697,13 +742,15 @@ class DpsSampler(object):
                 # Optional: use beta_t**p instead of beta_t in post-add operator (A/B/C/D only).
                 # This is a lightweight knob for quick operator ablations.
                 beta_like = beta_t
-                if self.like_beta_power != 1.0 and self.exp_key in ('A', 'B', 'C', 'D'):
+                if self.like_beta_power != 1.0 and self.exp_key in ('A', 'B', 'C', 'D', 'H'):
                     # beta_t is positive; allow non-integer powers for experimentation.
                     beta_like = torch.pow(beta_t, self.like_beta_power)
 
                 if self.exp_key == 'A':
                     like_scalar_t = beta_like.view(1, *shape_ones)
                 elif self.exp_key == 'B':
+                    like_scalar_t = beta_like.view(1, *shape_ones)
+                elif self.exp_key == 'H':
                     like_scalar_t = beta_like.view(1, *shape_ones)
                 elif self.exp_key == 'D':
                     alpha_bar_t = self.dm.alphas_cumprod[t]
@@ -721,6 +768,13 @@ class DpsSampler(object):
                     like_scalar_t = beta_like.view(1, *shape_ones)
 
                 correction = self.dps_lambda * like_scalar_t * grad_like
+
+                # EXP H optional SNR-based sigmoid gate (constant per run):
+                # w_like(t, SNR_dB) = lambda_like * beta_t * gate(SNR_dB)
+                if self.exp_key == 'H' and self.like_snr_gate:
+                    gate = 1.0 if self._like_gate_cached is None else float(self._like_gate_cached)
+                    gate_t = torch.tensor(gate, device=x_prior.device, dtype=x_prior.dtype).view(1, *shape_ones)
+                    correction = correction * gate_t
             
             # Debug mode: print detailed information for micro-test
             if self.debug_likelihood:
@@ -969,6 +1023,7 @@ class DpsSampler(object):
         return_all_timesteps: bool = False,
         num_steps: Optional[int] = None,
         snr: Optional[float] = None,
+        obs_snr_db: Optional[float] = None,
         diagnostic_recorder=None,
     ):
         """
@@ -998,6 +1053,19 @@ class DpsSampler(object):
             Final posterior samples (or all intermediate samples if requested).
         """
         B = y.shape[0]
+
+        # Cache SNR-gate for this run (EXP H only). This SNR is the observation-level SNR, constant per run.
+        if self.exp_key == 'H' and self.like_snr_gate:
+            if obs_snr_db is None:
+                # If caller doesn't provide it, fall back to snr (linear) if available.
+                if snr is not None and snr > 0:
+                    obs_snr_db = 10.0 * math.log10(float(snr))
+            if obs_snr_db is not None and self.like_snr_delta_db > 0:
+                x = (float(obs_snr_db) - self.like_snr0_db) / self.like_snr_delta_db
+                self._like_gate_cached = 1.0 / (1.0 + math.exp(-x))
+            else:
+                # No valid SNR information; default to no gating.
+                self._like_gate_cached = 1.0
 
         # Determine starting timestep based on SNR matching (equation 7)
         if snr is not None:
@@ -1119,6 +1187,7 @@ class DpsSampler(object):
         return_all_timesteps: bool = False,
         num_steps: Optional[int] = None,
         snr: Optional[float] = None,
+        obs_snr_db: Optional[float] = None,
         diagnostic_recorder=None,
     ):
         """
@@ -1139,5 +1208,6 @@ class DpsSampler(object):
             return_all_timesteps=return_all_timesteps,
             num_steps=num_steps,
             snr=snr,
+            obs_snr_db=obs_snr_db,
             diagnostic_recorder=diagnostic_recorder,
         )

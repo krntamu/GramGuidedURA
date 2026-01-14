@@ -10,11 +10,11 @@ This comprehensive guide covers the DPS (Diffusion Posterior Sampling) implement
 
 1. [Implementation Details](#implementation-details)
 2. [Hyperparameters](#hyperparameters)
-3. [DPS-COV Parameters](#dps-cov-parameters)
-4. [Diagnostic Tools](#diagnostic-tools)
-5. [FFT Invariance Diagnostics](#fft-invariance-diagnostics)
-6. [Usage Examples](#usage-examples)
-7. [Troubleshooting](#troubleshooting)
+3. [Likelihood EXP Keys (`--exp_key` A–H)](#likelihood-exp-keys---exp_key-a-h)
+4. [DPS-COV Parameters](#dps-cov-parameters)
+5. [Usage Examples](#usage-examples)
+6. [Troubleshooting](#troubleshooting)
+7. [Appendix (Diagnostics & FFT)](#appendix-diagnostics--fft)
 
 ---
 
@@ -53,6 +53,11 @@ where `rho = 10^(SNR_dB / 10)` is the linear SNR.
 
 This matches the AWGN function: `y = x + (1/sqrt(rho)) * multiplier * n`
 
+**Current CLI semantics (important):**
+- By default, `load_and_eval_dm_dps.py` derives `sigma_y2` from the current SNR (matches `functional.awgn`).
+- Use **fixed** `sigma_y2` only for ablations via:
+  - `--use_fixed_sigma_y2 --sigma_y2 <value>`
+
 ### 4. **SNR-Based Timestep Selection**
 
 The implementation automatically selects the starting timestep based on SNR:
@@ -61,6 +66,10 @@ t_start = int(torch.abs(self.dm.snrs - snr).argmin())
 ```
 
 This ensures that the reverse process starts from an appropriate noise level matching the observation SNR.
+
+**Important (current repo behavior):**
+- In `load_and_eval_dm_dps.py`, likelihood ablations **A–G** default to **full reverse chain** (SNR matching disabled) unless you pass `--enable_snr_matching`.
+- `exp_key=H` is **not** in that ablation list, so it uses SNR matching by default.
 
 ---
 
@@ -96,6 +105,54 @@ This ensures that the reverse process starts from an appropriate noise level mat
 - Can be adjusted based on observed behavior
 
 ---
+
+## Likelihood EXP Keys (`--exp_key` A–H)
+
+This section merges and replaces the older standalone EXP cheat sheet. The implementation lives in `dps_sampler.py` (`DpsSampler.reverse_step_dps()`).
+
+### Status (what we actually use)
+
+For this repo’s current results and curves, treat the likelihood side as having **two supported modes**:
+
+- **EXP H**: Tweedie-form / “x0-hat” likelihood guidance (post-add)
+- **EXP E**: closed-form likelihood score injection (paper-style)
+
+All other EXP keys are considered **legacy / ablation-only** and are good candidates for removal after code review (see cleanup checklist).
+
+### What `exp_key` controls (and what it does NOT)
+
+- **`--exp_key` controls likelihood guidance only** (how the likelihood term is formed/applied).
+- **Covariance / Gram guidance is orthogonal** and controlled by:
+  - `--method dps_cov_oracle|dps_cov_est`
+  - `--cov_lambda > 0`
+
+### Quick reference (recommended)
+
+| exp_key | Likelihood mode | When to use | Main knobs |
+|---|---|---|---|
+| **H** | **Tweedie / \(\hat x_0(H_t)\)** post-add | Default likelihood guidance for current experiments | `--dps_lambda`, optional `--like_snr_gate --like_snr0_db --like_snr_delta_db` |
+| **E** | **Closed-form likelihood** score injection | Paper-style likelihood variant / sanity checks | `--like_weight`, `--lw_schedule` (+ `--lw_tau/--lw_max/--lw_end/--lw_k`) |
+
+### EXP H (sigmoid-gated likelihood weight)
+
+For `exp_key=H`, you can optionally apply an observation-SNR gate:
+\[
+w_{\text{like}}(t,\mathrm{SNR}_{dB})=\lambda_{\text{dps}}\cdot \beta_t \cdot \text{gate}(\mathrm{SNR}_{dB})
+\]
+\[
+\text{gate}(\mathrm{SNR}_{dB})=\frac{1}{1+\exp\left(-\frac{\mathrm{SNR}_{dB}-\mathrm{SNR0}}{\Delta}\right)}
+\]
+
+CLI:
+- `--like_snr_gate`
+- `--like_snr0_db` (default `-10.5`)
+- `--like_snr_delta_db` (default `2.0`)
+
+### Legacy EXP keys (kept for ablation only)
+
+The following are **not** used for current headline curves and are candidates for removal after code checking:
+`A/B/C/D/Eprime/F/G`.
+If you still need them temporarily, keep them as “legacy ablations” but do not add new features on top.
 
 ## DPS-COV Parameters
 
@@ -185,7 +242,10 @@ Strength coefficient for covariance guidance. **Note**: If using `global` normal
 
 ### 4. `--cov_step_clip` (Clipping Threshold)
 
-Independent control over covariance correction clipping. Uses **norm-based clipping** (not element-wise).
+Independent control over covariance correction clipping. The **clipping operator** is controlled by `--cov_clip_mode`:
+- `auto`: elementwise for legacy `beta_t` path, norm otherwise
+- `elementwise`: element-wise clamp
+- `norm`: norm-based scaling clip (preserves direction)
 
 | Value | Effect |
 |-------|--------|
@@ -214,6 +274,7 @@ python load_and_eval_dm_dps.py \
     --cov_lambda 0.01 \
     --cov_scale_mode sqrt_beta_t \
     --cov_grad_norm none \
+    --cov_clip_mode norm \
     --cov_step_clip 2.0 \
     --dps_lambda 0.1 \
     --ch_type 3gpp \
@@ -229,6 +290,7 @@ python load_and_eval_dm_dps.py \
     --cov_lambda 0.0005 \
     --cov_scale_mode sqrt_beta_t \
     --cov_grad_norm none \
+    --cov_clip_mode norm \
     --cov_step_clip 2.0 \
     --dps_lambda 0.3
 ```
@@ -242,335 +304,80 @@ python load_and_eval_dm_dps.py \
 
 ---
 
-## Diagnostic Tools
+## Appendix (Diagnostics & FFT)
 
-### DPS Sampler Diagnostic Tool
+The long-form diagnostics sections were moved to:
 
-`dps_diagnostic_recorder.py` is a diagnostic tool for detecting magnitude issues in DPS sampler guidance, helping to quickly identify hyperparameter configuration problems.
+- `DPS_COMPLETE_USER_GUIDE_APPENDIX.md`
 
-#### Core Features
-
-1. **Magnitude Check**: Records gradient/correction magnitudes at each timestep
-2. **Pathology Diagnosis**: Automatically identifies three common issues (A: Too weak, B: Late-stage failure, C: Late-stage explosion)
-3. **Scaling Mode Testing**: Supports four scaling modes: `beta_t`, `sqrt_beta_t`, `constant`, `snr_aware`
-4. **Lambda Suggestions**: Automatically suggests reasonable initial `lambda_cov` values based on statistics
-5. **Proxy Testing**: Optional use of proxy gradient to verify if it's a `cov_grad` implementation issue
-
-#### Usage
-
-Enable diagnostic recording:
-
-```bash
-python load_and_eval_dm_dps.py \
-    --method dps_cov_oracle \
-    --cov_lambda 0.01 \
-    --cov_scale_mode sqrt_beta_t \
-    --cov_grad_norm none \
-    --cov_step_clip 2.0 \
-    --record_diagnostics \
-    --dps_lambda 0.1
-```
-
-#### Output Description
-
-**Console Output:**
-- **Pathology Diagnosis Results**: Whether issues A/B/C are detected
-- **Suggestions**: Specific repair suggestions for detected issues
-- **Lambda Suggestions**: Suggested `lambda_cov` values based on statistics
-
-**Diagnostic Summary Files:**
-Saved in `results/dm_dps/diagnostics/{timestamp}_snr{X}_summary.txt`:
-- `mean(c_t / b_t)`: Ratio of covariance correction to likelihood correction (target: 0.1-0.3)
-- `mean(clip_rate_cov)`: Proportion of covariance correction that is clipped (target: < 0.2)
-- `mean(||Δx_cov||)`: Magnitude of covariance correction
-- `mean(||Δx_like||)`: Magnitude of likelihood correction
-
-**Debug CSV Files** (if `--debug_cov_scaling` is enabled):
-Saved in `results/dm_dps/debug_cov_scaling/debug_snr{X}_scale_{mode}_norm_{norm}.csv`:
-
-Contains detailed statistics for each timestep:
-- `t`: Timestep
-- `beta_t`: Noise variance
-- `zeta_t`: Scaling factor
-- `grad_cov_raw_norm`: Raw gradient norm
-- `grad_cov_normed_norm`: Normalized gradient norm
-- `dx_cov_preclip_norm`: Correction norm before clipping
-- `dx_cov_postclip_norm`: Correction norm after clipping
-- `cov_clip_applied`: Whether clipping was applied
-
-#### Diagnosis Guide
-
-**Pathology A: Side Info Too Weak (`c_t << b_t`)**
-
-**Symptoms**:
-- `c_t / b_t` consistently < 0.1 (side correction < 10% likelihood correction)
-- `||grad_cov||` may be normal, but `c_t` is very small
-
-**Possible Causes**:
-1. `lambda_cov` too small
-2. `cov_grad` incorrectly normalized/scaled
-3. `sigma_y2` placed incorrectly
-
-**Fix Suggestions**:
-- Increase `lambda_cov`
-- Check `compute_cov_grad` implementation
-- Try `constant` or `sqrt_beta_t` scaling mode
-
-**Pathology B: Late-Stage Failure (`c_t` → 0 in later stages)**
-
-**Symptoms**:
-- `c_t` is normal in early stages, suddenly drops to near 0 in later stages
-- `zeta_t` becomes very small in later stages (if using `beta_t` scaling)
-
-**Possible Causes**:
-- `beta_t` scaling causes late-stage failure (`beta_t` becomes very small in later stages)
-
-**Fix Suggestions**:
-- Use `constant` or `sqrt_beta_t` scaling mode
-- Or use `snr_aware` mode (stronger in later stages)
-
-**Pathology C: Late-Stage Explosion + High Clip Rate**
-
-**Symptoms**:
-- `c_t` becomes very large in later stages (> 2x early stages)
-- `clip_rate_cov` > 50%
-- Curves show plateaus or rebounds
-
-**Possible Causes**:
-- Side guidance too strong in low-noise stages
-- `lambda_cov` too large
-- Scaling mode inappropriate
-
-**Fix Suggestions**:
-- Decrease `lambda_cov`
-- Use `beta_t` scaling (natural decay in later stages)
-- Increase `step_clip` threshold
-
-#### Lambda Suggestion Calculation
-
-The diagnostic tool automatically calculates suggested `lambda_cov` values based on:
-- Target: side correction ≈ 20% likelihood correction
-- Statistics from mid-to-late timesteps (t ≈ 0.6T - 0.9T)
-- Formula: `lambda_cov ≈ 0.2 * mean_like / (scale_t * mean_grad_cov)`
-
-**Note**: This is only an initial suggestion and may need fine-tuning based on actual results.
-
----
-
-## FFT Invariance Diagnostics
-
-### Overview
-
-The FFT invariance diagnostic module (`fft_diagnostics.py`) verifies that NMSE (Normalized Mean Squared Error) is invariant to IFFT transformation. This is critical because channel estimation is performed in the frequency domain (angular domain), but evaluation is done in the spatial domain after IFFT.
-
-### Why This Matters
-
-In the DPS-COV pipeline:
-1. **Training/Inference**: Channels are transformed to frequency domain using FFT (`fft_pre=True`)
-2. **Evaluation**: Estimates are transformed back to spatial domain using IFFT for NMSE computation
-3. **Requirement**: Since FFT/IFFT is a unitary transformation, NMSE should be identical in both domains (up to numerical precision)
-
-If NMSE differs significantly between angular and spatial domains, it indicates:
-- FFT/IFFT normalization issues
-- Incorrect complex tensor handling
-- Domain mismatch in metric computation
-
-### Features
-
-The FFT diagnostics module provides:
-
-1. **Test 1: FFT/IFFT Unitarity Check**
-   - Verifies that FFT/IFFT preserves Frobenius norm
-   - Checks energy preservation: `||A||_F^2 ≈ ||A_fft||_F^2 ≈ ||A_rec||_F^2`
-   - Validates reconstruction: `||A_rec - A||_F / ||A||_F < 1e-6`
-
-2. **Test 2: Complex Conversion & Dimension Check**
-   - Verifies correct complex tensor handling
-   - Tests FFT on actual channel data format `[B, 2, R, T]`
-   - Ensures correct dimension usage for 2D FFT
-
-3. **End-to-End Invariance Audit**
-   - Compares NMSE computed in angular vs spatial domains
-   - Uses the same ground truth and estimate tensors
-   - Expected: `|NMSE_ang - NMSE_sp| < 1e-6`
-
-### Usage
-
-#### Basic Usage
-
-Enable FFT diagnostics during evaluation:
-
-```bash
-python load_and_eval_dm_dps.py \
-    --method dps_cov_oracle \
-    --cov_lambda 0.01 \
-    --cov_scale_mode sqrt_beta_t \
-    --run_fft_diagnostics \
-    --dps_lambda 0.1 \
-    --ch_type 3gpp \
-    --n_path 3
-```
-
-#### With Debug Output
-
-Enable detailed FFT operation logging:
-
-```bash
-python load_and_eval_dm_dps.py \
-    --method dps_cov_oracle \
-    --cov_lambda 0.01 \
-    --cov_scale_mode sqrt_beta_t \
-    --run_fft_diagnostics \
-    --fft_diagnostics_debug \
-    --dps_lambda 0.1 \
-    --ch_type 3gpp \
-    --n_path 3
-```
-
-#### Parameters
-
-- `--run_fft_diagnostics`: Enable FFT invariance diagnostics (default: disabled)
-- `--fft_diagnostics_debug`: Enable detailed debug prints showing FFT operation details
-
-**Note**: Diagnostics run only once (on first batch, first SNR) to avoid cluttering output.
-
-### Output Description
-
-#### Test 1: FFT/IFFT Unitarity Check
-
-```
-======================================================================
-Test 1: FFT/IFFT Unitarity Check (Normalization)
-======================================================================
-  Mode: 2D, Shape: (64, 16)
-
-  ||A||_F^2 = 1.234567e+02
-  ||A_fft||_F^2 = 1.234567e+02
-  ||A_rec||_F^2 = 1.234567e+02
-
-  Energy preservation (FFT): |||A||^2 - ||A_fft||^2| / ||A||^2 = 1.234e-10
-  Energy preservation (IFFT): |||A||^2 - ||A_rec||^2| / ||A||^2 = 1.234e-10
-
-  Reconstruction error: ||A_rec - A||_F = 1.234e-10
-  Relative reconstruction error: ||A_rec - A||_F / ||A||_F = 1.234e-10
-
-  Expected: Energy errors < 1e-6, Reconstruction error < 1e-6
-  ✓ PASS: FFT/IFFT preserves energy and reconstructs correctly
-======================================================================
-```
-
-#### Test 2: Complex Conversion & Dimension Check
-
-```
-======================================================================
-Test 2: Complex Conversion & Dimension Check
-======================================================================
-  Input shape: torch.Size([2, 64, 16]), Mode: 2D
-  Hc shape (complex): (64, 16)
-
-  ||Hc||_F^2 = 1.234567e+02
-  ||Hc_fft||_F^2 = 1.234567e+02
-  ||Hc_rec||_F^2 = 1.234567e+02
-
-  Energy preservation (FFT): |||Hc||^2 - ||Hc_fft||^2| / ||Hc||^2 = 1.234e-10
-  Energy preservation (IFFT): |||Hc||^2 - ||Hc_rec||^2| / ||Hc||^2 = 1.234e-10
-
-  Reconstruction error: ||Hc_rec - Hc||_F = 1.234e-10
-  Relative reconstruction error: ||Hc_rec - Hc||_F / ||Hc||_F = 1.234e-10
-
-  Expected: Energy errors < 1e-6, Reconstruction error < 1e-6
-  ✓ PASS: Complex FFT handling is correct
-======================================================================
-```
-
-#### End-to-End Invariance Audit
-
-```
-======================================================================
-Corrected NMSE FFT Invariance Diagnostic
-======================================================================
-  Input shapes: H_gt_ang=torch.Size([512, 2, 64, 16]), H_hat_ang=torch.Size([512, 2, 64, 16])
-  Mode: 2D
-  Using _4d_array=False (same as normal NMSE_sp computation path)
-
-  Results:
-  ------------------------------------------------------------------
-    NMSE_ang = 1.234567e-02
-    NMSE_sp  = 1.234567e-02
-    Absolute difference |NMSE_ang - NMSE_sp| = 1.234e-10
-    Relative difference = 1.234e-10
-
-  Expected: NMSE_ang ≈ NMSE_sp
-  Expected: Absolute difference ≲ 1e-6 (numerical precision)
-  ✓ PASS: NMSE is invariant to IFFT (within numerical precision)
-======================================================================
-```
-
-### Interpretation Guide
-
-**If Test 1 fails:**
-- **Root cause #1**: FFT normalization mismatch detected
-- **Action**: Check `modules/utils.py` `complex_1d_fft` function, verify `norm="ortho"` is used
-
-**If Test 2 fails:**
-- **Root cause #2**: Incorrect complex handling or FFT dimension usage
-- **Action**: Verify tensor format `[B, 2, R, T]` and dimension indexing
-
-**If both tests pass but end-to-end audit fails:**
-- **Root cause #3**: Metric aggregation or domain mixing issue
-- **Action**: Check NMSE computation code, ensure consistent tensor representations
-
-**If all tests pass:**
-- ✓ FFT/IFFT implementation is correct
-- ✓ NMSE computation is consistent across domains
-- ✓ No action needed
-
-### Module Structure
-
-The FFT diagnostics are implemented in a separate module `fft_diagnostics.py`:
-
-- **Helper functions**: `to_complex()`, `fro2()`, `relerr()`
-- **Test functions**: `test_fft_ifft_unitarity()`, `test_complex_fft_dimensions()`
-- **Main functions**: `run_nmse_fft_diagnostics()`, `run_end_to_end_invariance_audit()`
-
-The module is optional - if `fft_diagnostics.py` is missing, the main script will warn but continue normally.
+This keeps the main guide concise for code review while preserving the full diagnostic recipes and reference outputs.
 
 ---
 
 ## Usage Examples
 
-### Basic DPS Evaluation
+### Recommended baseline: EXP H (Tweedie-form likelihood)
 
 ```bash
 python load_and_eval_dm_dps.py \
     --method dps \
+    --exp_key H \
     --dps_lambda 0.1 \
     --ch_type 3gpp \
     --n_path 3
 ```
 
-### DPS with Covariance Guidance (Oracle)
+Quadriga LOS variant (same setup; only `--dps_lambda` changes):
+
+```bash
+python load_and_eval_dm_dps.py \
+    --method dps \
+    --exp_key H \
+    --dps_lambda 0.3 \
+    --ch_type quadriga_LOS
+```
+
+### EXP H + covariance guidance (oracle)
 
 ```bash
 python load_and_eval_dm_dps.py \
     --method dps_cov_oracle \
+    --exp_key H \
     --cov_lambda 0.01 \
     --cov_scale_mode sqrt_beta_t \
     --cov_grad_norm none \
+    --cov_clip_mode norm \
     --cov_step_clip 2.0 \
     --dps_lambda 0.1 \
     --ch_type 3gpp \
     --n_path 3
 ```
 
-### DPS with Estimated Covariance
+Quadriga LOS variant (only `--cov_lambda` and `--dps_lambda` change):
+
+```bash
+python load_and_eval_dm_dps.py \
+    --method dps_cov_oracle \
+    --exp_key H \
+    --cov_lambda 0.0005 \
+    --cov_scale_mode sqrt_beta_t \
+    --cov_grad_norm none \
+    --cov_clip_mode norm \
+    --cov_step_clip 2.0 \
+    --dps_lambda 0.3 \
+    --ch_type quadriga_LOS
+```
+
+### EXP H + covariance guidance (estimated)
 
 ```bash
 python load_and_eval_dm_dps.py \
     --method dps_cov_est \
+    --exp_key H \
     --cov_lambda 0.01 \
     --cov_scale_mode sqrt_beta_t \
     --cov_grad_norm none \
+    --cov_clip_mode norm \
     --cov_step_clip 2.0 \
     --n_time_samples 2000 \
     --modulation bpsk \
@@ -579,70 +386,69 @@ python load_and_eval_dm_dps.py \
     --n_path 3
 ```
 
-### Quick Sanity Check with Diagnostics
+Quadriga LOS variant (only `--cov_lambda` and `--dps_lambda` change):
+
+```bash
+python load_and_eval_dm_dps.py \
+    --method dps_cov_est \
+    --exp_key H \
+    --cov_lambda 0.0005 \
+    --cov_scale_mode sqrt_beta_t \
+    --cov_grad_norm none \
+    --cov_clip_mode norm \
+    --cov_step_clip 2.0 \
+    --n_time_samples 2000 \
+    --modulation bpsk \
+    --dps_lambda 0.3 \
+    --ch_type quadriga_LOS
+```
+### Disable likelihood / disable Gram (how to toggle)
+
+- **Disable likelihood**: set `--dps_lambda 0` (works for EXP H).
+- **Disable Gram/cov**: use `--method dps` (or set `--cov_lambda 0` with a cov method).
+
+Example (Gram-only, no likelihood):
 
 ```bash
 python load_and_eval_dm_dps.py \
     --method dps_cov_oracle \
+    --exp_key H \
+    --dps_lambda 0 \
     --cov_lambda 0.01 \
     --cov_scale_mode sqrt_beta_t \
     --cov_grad_norm none \
+    --cov_clip_mode norm \
     --cov_step_clip 2.0 \
-    --dps_lambda 0.1 \
-    --record_diagnostics \
-    --run_fft_diagnostics \
-    --sanity_snrs
+    --ch_type 3gpp \
+    --n_path 3
 ```
 
-### Comprehensive Testing Workflow
+### EXP E (closed-form likelihood score injection)
 
 ```bash
-# 1. Test with default parameters and enable all diagnostics
 python load_and_eval_dm_dps.py \
-    --method dps_cov_oracle \
-    --cov_lambda 0.01 \
-    --cov_scale_mode sqrt_beta_t \
-    --cov_grad_norm none \
-    --cov_step_clip 2.0 \
-    --record_diagnostics \
-    --run_fft_diagnostics \
-    --dps_lambda 0.1 \
-    --sanity_snrs
+    --method dps \
+    --exp_key E \
+    --like_weight 1.0 \
+    --lw_schedule const \
+    --ch_type 3gpp \
+    --n_path 3
+```
 
-# 2. If Pathology B (late-stage failure) is detected, try constant mode
+Notes:
+- EXP E’s likelihood strength is controlled by `--like_weight` / `--lw_schedule` (not `--dps_lambda`).
+- SNR matching for EXP E is **disabled by default** (full reverse chain). Enable it explicitly with `--enable_snr_matching`.
+
+### Single-SNR quick runs
+
+```bash
 python load_and_eval_dm_dps.py \
-    --method dps_cov_oracle \
-    --cov_lambda 0.01 \
-    --cov_scale_mode constant \
-    --cov_grad_norm global \
-    --cov_step_clip 2.0 \
-    --record_diagnostics \
+    --method dps_cov_est \
+    --exp_key H \
+    --single_snr_db 5 \
+    --enable_snr_matching \
     --dps_lambda 0.1 \
-    --sanity_snrs
-
-# 3. If Pathology A (too weak) is detected, use suggested lambda_cov
-python load_and_eval_dm_dps.py \
-    --method dps_cov_oracle \
-    --cov_lambda <suggested_value> \
-    --cov_scale_mode sqrt_beta_t \
-    --cov_grad_norm none \
-    --cov_step_clip 2.0 \
-    --record_diagnostics \
-    --dps_lambda 0.1 \
-    --sanity_snrs
-
-# 4. Compare different scaling modes
-for mode in beta_t sqrt_beta_t constant snr_aware; do
-    python load_and_eval_dm_dps.py \
-        --method dps_cov_oracle \
-        --cov_lambda 0.01 \
-        --cov_scale_mode $mode \
-        --cov_grad_norm none \
-        --cov_step_clip 2.0 \
-        --record_diagnostics \
-        --dps_lambda 0.1 \
-        --sanity_snrs
-done
+    --cov_lambda 0.01
 ```
 
 ---
