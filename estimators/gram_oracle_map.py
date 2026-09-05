@@ -100,29 +100,51 @@ def gram_oracle_map_given_delta(
     if r == 0:
         return np.zeros_like(Y), float("inf")
 
-    # Build Toeplitz covariances and inverses (stable PSD projection)
-    C_rx = ut.toeplitz(t_rx)
-    C_tx = ut.toeplitz(t_tx)
-    C_rx_inv, _ = _inv_psd_hermitian_np(C_rx, eps=opts.eps_cov)
-    C_tx_inv, _ = _inv_psd_hermitian_np(C_tx, eps=opts.eps_cov)
-    C_tx_inv_T = C_tx_inv.T  # needed for vec(H) with column-stacking
+    is_independent_cols = (t_rx.ndim == 2)
+    dev = torch.device(opts.device)
 
     # Precompute small matrices in numpy
     UHY = U.conj().T @ Y  # (r,Nt)
     s_row = s.reshape(r, 1)
-    # Rx-side small matrix A = U^H C_rx^{-1} U
-    A = U.conj().T @ C_rx_inv @ U
-    G = (s.reshape(-1, 1) * A) * s.reshape(1, -1)  # Sigma A Sigma
+
+    if is_independent_cols:
+        # t_rx is [Nt, Nr]
+        G_list = []
+        logdet_Cdelta = 0.0
+        for k in range(Nt):
+            # In multi-user pseudo dataset, each column is directly drawn from CN(0, C_rx_k)
+            # without scaling by any common tx_var. We just use C_rx_k.
+            C_rx_k = ut.toeplitz(t_rx[k])
+            C_rx_inv_k, logdet_rx_k = _inv_psd_hermitian_np(C_rx_k, eps=opts.eps_cov)
+            
+            logdet_Cdelta += logdet_rx_k
+            
+            A_k = U.conj().T @ C_rx_inv_k @ U
+            G_k = (s.reshape(-1, 1) * A_k) * s.reshape(1, -1)
+            G_list.append(G_k)
+        G_t = torch.tensor(np.stack(G_list), dtype=opts.dtype, device=dev) # (Nt, r, r)
+    else:
+        # Build Toeplitz covariances and inverses (stable PSD projection)
+        C_rx = ut.toeplitz(t_rx)
+        C_tx = ut.toeplitz(t_tx)
+        C_rx_inv, logdet_rx = _inv_psd_hermitian_np(C_rx, eps=opts.eps_cov)
+        C_tx_inv, logdet_tx = _inv_psd_hermitian_np(C_tx, eps=opts.eps_cov)
+        C_tx_inv_T = C_tx_inv.T  # needed for vec(H) with column-stacking
+        
+        logdet_Cdelta = logdet_rx * C_tx.shape[0] + logdet_tx * C_rx.shape[0]
+        
+        # Rx-side small matrix A = U^H C_rx^{-1} U
+        A = U.conj().T @ C_rx_inv @ U
+        G = (s.reshape(-1, 1) * A) * s.reshape(1, -1)  # Sigma A Sigma
+        G_t = torch.tensor(G, dtype=opts.dtype, device=dev)      # (r,r) Hermitian
+        C_t = torch.tensor(C_tx_inv_T, dtype=opts.dtype, device=dev)  # (Nt,Nt)
 
     # Initialize V (Nt,r) using Procrustes
     V0 = _procrustes_v_init_np(UHY, s)
 
     # Torch optimization on complex Stiefel: V^H V = I (NO autograd; analytic gradient)
-    dev = torch.device(opts.device)
     V = torch.tensor(V0, dtype=opts.dtype, device=dev)
     UHY_t = torch.tensor(UHY, dtype=opts.dtype, device=dev)  # (r,Nt)
-    G_t = torch.tensor(G, dtype=opts.dtype, device=dev)      # (r,r) Hermitian
-    C_t = torch.tensor(C_tx_inv_T, dtype=opts.dtype, device=dev)  # (Nt,Nt)
     s_t = torch.tensor(s, dtype=opts.dtype, device=dev).view(r, 1)  # (r,1)
 
     sigma2_f = float(sigma2)
@@ -150,21 +172,49 @@ def gram_oracle_map_given_delta(
         return Gm - Vm @ sym
 
     def objective(Vm: torch.Tensor) -> torch.Tensor:
-        # like: ||B - V Sigma||^2 / sigma2
+        # MAP objective for V given R, delta.
+        # This is strictly evaluating the negative log posterior.
+        # -log p(Y|V,R) - log p_prior(V|R,delta)
+        # where the likelihood is ||B - V Sigma||^2 / sigma2
+        # and prior is the quadratic form.
         VS = Vm * s_vec.view(1, -1)  # (Nt,r)
         diff = B_t - VS
         loss_like = (diff.abs() ** 2).sum() / sigma2_f
-        # prior: q_scale * tr(G @ (V^H C V))
-        Bmat = Vm.conj().T @ (C_t @ Vm)
-        loss_prior = torch.real(torch.trace(G_t @ Bmat)) * q_scale
+        # prior
+        if is_independent_cols:
+            # sum_k v_k^H G_k v_k
+            # Vm is (Nt, r), Vm.unsqueeze(1) is (Nt, 1, r)
+            # G_t is (Nt, r, r)
+            # bmm(G_t, Vm.conj().unsqueeze(-1)) is (Nt, r, 1)
+            term = torch.bmm(Vm.unsqueeze(1), torch.bmm(G_t, Vm.conj().unsqueeze(-1)))
+            loss_prior = term.real.sum() * q_scale
+        else:
+            # prior: q_scale * tr(G @ (V^H C V))
+            Bmat = Vm.conj().T @ (C_t @ Vm)
+            loss_prior = torch.real(torch.trace(G_t @ Bmat)) * q_scale
         return loss_like + loss_prior
 
     for it in range(int(opts.n_iters)):
         # Euclidean gradient
         # d/dV ||B - V Sigma||^2 = 2 (V Sigma^2 - B Sigma)
         grad_like = (V * s2_vec.view(1, -1) - B_t * s_vec.view(1, -1)) * (2.0 / sigma2_f)
-        # d/dV tr(G V^H C V) = 2 C V G  (for Hermitian C,G)
-        grad_prior = 2.0 * (C_t @ V @ G_t) * q_scale
+        
+        if is_independent_cols:
+            # k-th row is 2.0 * (V[k, :] @ G_k)
+            # V is (Nt, r), V.unsqueeze(1) is (Nt, 1, r)
+            # G_t is (Nt, r, r)
+            # grad_prior_rows: bmm(Ntx1xr, Ntxrxr) -> Ntx1xr -> (Nt, r)
+            grad_prior_rows = torch.bmm(V.unsqueeze(1), G_t).squeeze(1) # (Nt, r)
+            # The quadratic form is sum_k v_k^H G_k v_k. 
+            # Grad w.r.t v_k^* is G_k v_k.
+            # But the objective is a real scalar. If we use Wirtinger calculus, 
+            # grad_V = 2 * d_V* F = 2 * [G_1 v_1, ..., G_Nt v_Nt]^T
+            # So the formula was actually correct!
+            grad_prior = 2.0 * grad_prior_rows * q_scale
+        else:
+            # d/dV tr(G V^H C V) = 2 C V G  (for Hermitian C,G)
+            grad_prior = 2.0 * (C_t @ V @ G_t) * q_scale
+            
         grad = grad_like + grad_prior
 
         grad = stiefel_project(V, grad)
@@ -186,7 +236,15 @@ def gram_oracle_map_given_delta(
     # Return objective value in numpy for delta MAP selection
     # Recompute final objective in numpy (stable)
     like_obj = np.sum(np.abs(UHY - (s_row * V_np.conj().T)) ** 2) / max(sigma2, 1e-12)
-    prior_obj = np.real(np.trace(G @ (V_np.conj().T @ (C_tx_inv_T @ V_np)))) * q_scale
-    return H_hat, float(like_obj + prior_obj)
+    if is_independent_cols:
+        prior_obj = 0.0
+        for k in range(Nt):
+            vk = V_np[k, :]  # (r,)
+            prior_obj += np.real(np.vdot(vk, G_list[k] @ vk))
+        prior_obj *= q_scale
+    else:
+        prior_obj = np.real(np.trace(G @ (V_np.conj().T @ (C_tx_inv_T @ V_np)))) * q_scale
+        
+    return H_hat, float(like_obj + prior_obj + logdet_Cdelta)
 
 

@@ -398,3 +398,40 @@ def cov_angular_to_spatial(cov_ri: torch.Tensor) -> torch.Tensor:
     # (F^H * R) * F
     R = torch.fft.fft(R, dim=-1, norm="ortho")
     return _complex_to_ri(R)
+
+
+def tx_gram_spatial_to_angular(C: torch.Tensor) -> torch.Tensor:
+    """
+    Map an N_T×N_T spatial **transmit-side** matrix C (e.g. C = X_p X_p^H) into the Tx angular
+    basis using the **same** unitary similarity as ``cov_spatial_to_angular`` uses for an N×N
+    Gram on the **first** index:
+
+        C_tilde = F_tx C F_tx^H,
+
+    implemented as ``fft(·, dim=-2)`` then ``ifft(·, dim=-1)`` with ``norm='ortho'`` (see
+    ``cov_spatial_to_angular``). This is **not** an entrywise FFT of C; it is the operator
+    pushforward consistent with that receive-Gram helper, applied on the Tx dimension.
+
+    Parameters
+    ----------
+    C : torch.Tensor
+        Complex (N_T, N_T) or batched (B, N_T, N_T).
+
+    Returns
+    -------
+    torch.Tensor
+        Same shape as ``C``, complex.
+    """
+    if C.dim() == 2:
+        Cb = C.unsqueeze(0)
+        squeeze = True
+    elif C.dim() == 3:
+        Cb = C
+        squeeze = False
+    else:
+        raise ValueError(f"Expected C with shape (N_T, N_T) or (B, N_T, N_T), got {tuple(C.shape)}")
+    if Cb.size(-1) != Cb.size(-2):
+        raise ValueError("C must be square in the last two dimensions.")
+    out = torch.fft.fft(Cb, dim=-2, norm="ortho")
+    out = torch.fft.ifft(out, dim=-1, norm="ortho")
+    return out.squeeze(0) if squeeze else out

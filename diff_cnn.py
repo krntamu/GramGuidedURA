@@ -19,10 +19,12 @@ CUDA_DEFAULT_ID = 0
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', '-d', default='cpu', type=str)
+    parser.add_argument('--ch_type', type=str, default='3gpp', help='Channel type {3gpp, quadriga_LOS, pseudo_multiuser_3gpp}')
 
     # get the used device
     args = parser.parse_args()
     device = args.device
+    print(f"[diff_cnn] cwd={os.getcwd()} ch_type={args.ch_type} device={device}", flush=True)
 
     date_time_now = datetime.datetime.now()
     date_time = date_time_now.strftime('%Y-%m-%d_%H-%M-%S')  # convert to str compatible with all OSs
@@ -38,7 +40,7 @@ def main():
     fft_pre = True # learn channel distribution in angular domain through Fourier transform
 
     # set data params
-    ch_type = '3gpp' # {quadriga_LOS, 3gpp}
+    ch_type = args.ch_type # {quadriga_LOS, 3gpp, pseudo_multiuser_3gpp}
     n_path = 3
     if n_dim2 > 1:
         mode = '2D'
@@ -46,10 +48,12 @@ def main():
         mode = '1D'
     complex_data = True
 
+    print(f"[diff_cnn] loading data from bin/ (may take a while on shared filesystem)...", flush=True)
     data_train, data_val, data_test = ut.load_or_create_data(ch_type=ch_type, n_path=n_path, n_antennas_rx=n_dim,
                                      n_antennas_tx=n_dim2, n_train_ch=num_train_samples, n_val_ch=num_val_samples,
                                      n_test_ch=num_test_samples, return_toep=False)
-    if ch_type.startswith('3gpp') and n_dim2 > 1:
+    print(f"[diff_cnn] data shapes train={getattr(data_train, 'shape', None)} val={getattr(data_val, 'shape', None)} test={getattr(data_test, 'shape', None)}", flush=True)
+    if (ch_type.startswith('3gpp') or ch_type.startswith('pseudo')) and n_dim2 > 1:
         data_train = np.reshape(data_train, (-1, n_dim, n_dim2), 'F')
         data_test = np.reshape(data_test, (-1, n_dim, n_dim2), 'F')
         data_val = np.reshape(data_val, (-1, n_dim, n_dim2), 'F')
@@ -59,7 +63,7 @@ def main():
     data_val = cmplx2real(data_val, dim=1, new_dim=False).float()
     data_test = torch.from_numpy(np.asarray(data_test[:, None, :]))
     data_test = cmplx2real(data_test, dim=1, new_dim=False).float()
-    if ch_type.startswith('3gpp'):
+    if ch_type.startswith('3gpp') or ch_type.startswith('pseudo'):
         ch_type += f'_path={n_path}'
 
     # set data params
@@ -167,10 +171,10 @@ def main():
     lr_init = 1e-4
     lr_step_multiplier = 1.0
     epochs_until_lr_step = 150
-    num_epochs = 500
+    num_epochs = 200
     val_every_n_batches = 2000
     num_min_epochs = 50
-    num_epochs_no_improve = 20
+    num_epochs_no_improve = 10
     track_val_loss = True
     track_fid_score = False
     track_mmd = False
@@ -223,11 +227,18 @@ def main():
     # instantiate CNN, DiffusionModel, Trainer and Tester
     cnn = CNN(**cnn_dict)
     diffusion_model = DiffusionModel(cnn, **diff_model_dict)
+    _p0 = next(diffusion_model.parameters())
+    print(
+        f"[diff_cnn] training device check: first_param={_p0.device} "
+        f"cuda_available={torch.cuda.is_available()} "
+        f"cuda_device_count={torch.cuda.device_count() if torch.cuda.is_available() else 0}",
+        flush=True,
+    )
     trainer = Trainer(diffusion_model, data_train, data_val, **trainer_dict)
     tester = Tester(diffusion_model, data_test, **tester_dict)
 
     # Print number of trainable parameters
-    print(f'Number of trainable model parameters: {diffusion_model.num_parameters}')
+    print(f'Number of trainable model parameters: {diffusion_model.num_parameters}', flush=True)
 
     # other parameters dictionary, which is saved in 'sim_params.json'
     misc_dict = {'num_parameters': diffusion_model.num_parameters}
@@ -243,6 +254,7 @@ def main():
     }
 
     utils.save_params(dir_result=dir_result, filename='sim_params', params=sim_dict)
+    print(f"[diff_cnn] saved sim_params.json; starting training -> {dir_result}", flush=True)
 
     # run training routine
     train_dict = trainer.train()

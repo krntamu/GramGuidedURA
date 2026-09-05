@@ -8,20 +8,61 @@ Key Design Decisions:
 1. Gradient correction is applied AFTER the prior reverse step (not before)
 2. Deterministic DDIM-style steps (add_random=False) are recommended
 3. Step size scales with beta_t (forward process noise variance)
-4. Optional gradient/step clipping for numerical stability
+4. Optional clipping of the likelihood correction (per-sample L2 norm or elementwise) and cov correction
 
 Theory:
 For observation model y = x + n, n ~ N(0, sigma_y^2 I):
 - Likelihood gradient: ∇_x log p(y|x) = (y - x) / sigma_y^2
 - DPS update: x_prev = x_prior + lambda_dps * beta_t * grad(x_prior, y)
+
+Domain (with `load_and_eval_dm_dps.py` defaults):
+- **Angular diffusion:** the unconditional DM is trained on the **angular-domain** channel
+  ``\\tilde{H}`` (same unitary FFT as the channel simulator). Reverse diffusion, Gram guidance,
+  and likelihood guidance all update ``\\tilde{H}_t`` in that domain; the final estimate is mapped
+  back to spatial with the inverse FFT if needed.
+- **Paper / Algorithm 1 view (orthonormal pilots):** pilot observations are reduced to an
+  **angular effective observation** ``\\tilde{Y}`` by composing DFTs with pilot-side decorrelation,
+  schematically ``\\tilde{Y} \\leftarrow \\Phi_{N_R} Y_p X_p^H (X_p X_p^H)^{-1} \\Phi_{N_T}^H`` (exact
+  layout matches your notation). Multiuser **block-orthonormal** ``X_p`` is the same idea with
+  block structure: still formulate ``\\tilde{Y}``, ``\\tilde{H}``, and (Gram) ``\\tilde{R}`` in the
+  angular domain, then run diffusion there. Spatial AWGN on the grid maps to complex Gaussian noise
+  in angular coordinates under the usual circulant / 2-D DFT model.
+- **Implementation vs notation:** this repo may build likelihood directions by applying ``X_p^H`` on
+  **spatial** ``Y_p`` and ``\\hat{H}`` and then FFT-ing, or by precomputing ``\\tilde{Y}`` once and
+  differencing against ``\\mathcal{T}(\\tilde{H}_t)`` in angular space. Those are the **same linear
+  map** written in two orders; it is not a different physical model.
+- **Why FFT for non-orthonormal pilots:** the goal is **representation alignment** with the
+  orthonormal (angular) pipeline and the DM trained on ``\\tilde{H}``, **not** to claim that the
+  pilot noise becomes white in angular coordinates. After FFT, effective noise covariance is
+  generally **not** proportional to identity; treating likelihood or timestep choice as if it were
+  is only a convenience / approximation.
+- **Pilot likelihood domain (Gaussian / nonorthogonal pilots):** default ``pilot_likelihood_domain='spatial'``
+  keeps the existing spatial residual then FFT. Optional ``'angular_ls'`` forms ``Y' = Y_p X_p^H C^{-1}``,
+  FFTs to ``Y_tilde``, and uses ``(Y_tilde - \\hat{\\tilde{H}}_0)\\,(F_{tx} C F_{tx}^{\\mathsf H})`` with
+  ``C = X_p X_p^{\\mathsf H}`` (see ``angular_ls_mahalanobis_likelihood_grad_angular`` and
+  ``tx_gram_spatial_to_angular``).
+- **``SNR_eff`` / ``t*`` matching (``gaussian_pilot_snr_match``):** maps a **scalar** summary of LS
+  effective noise (via ``\\mathrm{tr}(C^{-1})``) onto the **isotropic** DDPM schedule ``\\bar{\\alpha}_t
+  / (1-\\bar{\\alpha}_t)``. That is a **heuristic** for choosing ``t^*`` and init scale; it does **not**
+  rigorously match the true posterior or the colored noise after pilot compression and FFT.
+
+**Mahalanobis / non-orthonormal pilots.** With ``C = X_p X_p^H``, the spatial equivalent model
+``Y' = H + N'`` has ``\\mathrm{Cov}(N') = \\sigma^2 C^{-1}``. The correct score w.r.t. ``H`` is
+proportional to ``(Y_p - H X_p)X_p^H`` (equivalently ``(Y'-H)C``). In angular coordinates that
+appears as the **composed** operator, not a plain entrywise ``\\tilde{Y} - \\tilde{H}``, unless
+``C = I`` (orthonormal pilots). When ``X_p \\approx I`` (square), ``(Y_p - H X_p)X_p^H \\approx Y_p - H``
+and ``FFT(Y_p) - x0_hat`` matches the orthonormal-pilot likelihood shortcut.
 """
 
 from typing import Callable, Optional, Literal
 import math
+import warnings
 
 import torch
 from torch import Tensor
 from DMCE import utils as dm_utils
+import modules.utils as ut
+from modules import pilot_matrix as _pm_pilot
 
 
 # -------------------------- Likelihood gradient -------------------------- #
@@ -47,6 +88,148 @@ def make_awgn_likelihood_grad(sigma_y2: float) -> Callable[[Tensor, Tensor, int]
         return diff / (sigma_y2)
 
     return likelihood_grad_fn
+
+
+def _tweedie_x0_hat_pred_noise(x_t_ri: Tensor, dm, t: int) -> Tensor:
+    """DDPM/Tweedie x0_hat(H_t) from pred_noise objective (same construction as exp H)."""
+    if dm.objective != "pred_noise":
+        raise NotImplementedError(
+            "Gaussian-pilot likelihood requires DiffusionModel objective='pred_noise'."
+        )
+    b, *_ = x_t_ri.shape
+    batched_times = torch.full((b,), t, device=dm.device, dtype=torch.long)
+    eps_hat = dm.model(x_t_ri, batched_times)
+    a = torch.clamp(dm.alphas_cumprod[t].to(x_t_ri.device), min=1e-12)
+    shape_ones = (1,) * (x_t_ri.ndim - 1)
+    a_view = a.view(1, *shape_ones)
+    one_minus_a = torch.clamp(1.0 - a_view, min=1e-12)
+    score_prior = -eps_hat / torch.sqrt(one_minus_a)
+    x0_hat = (x_t_ri + one_minus_a * score_prior) / torch.sqrt(a_view + 1e-12)
+    return x0_hat
+
+
+def nonorthogonal_pilot_likelihood_grad_angular(
+    x_t_ri: Tensor,
+    gp_ctx: dict,
+    dm,
+    t: int,
+    sigma_y2: float,
+) -> Tensor:
+    """
+    DPS likelihood direction from the equivalent model ``Y' = Y_p X_p^H C^{-1} = H + N'`` with
+    ``C = X_p X_p^H``: gradient w.r.t. ``H`` (spatial) is proportional to ``(Y' - H_0) C``.
+    Map to angular with the same FFT as ``H`` (entrywise linearity in the channel matrix).
+
+    Divides by ``sigma_y2`` so this matches orthogonal Exp H, which uses ``(y - x0_hat) / sigma_y2``.
+    """
+    fft_mode = str(gp_ctx["fft_mode"])
+    x0_hat = _tweedie_x0_hat_pred_noise(x_t_ri, dm, t)
+    H0_sp = ut.complex_1d_fft(x0_hat, ifft=True, mode=fft_mode, _4d_array=False)
+    if H0_sp.dim() != 4 or H0_sp.size(1) != 2:
+        raise ValueError(f"Expected H0_sp (B,2,N_R,N_T), got {tuple(H0_sp.shape)}")
+    H0c = torch.complex(H0_sp[:, 0], H0_sp[:, 1])
+    Y_prime = gp_ctx["Y_prime_c"].to(device=H0c.device, dtype=H0c.dtype)
+    gram = gp_ctx["gram_c"].to(device=H0c.device, dtype=H0c.dtype)
+    if Y_prime.shape != H0c.shape:
+        raise ValueError(f"Y_prime_c {tuple(Y_prime.shape)} vs H0 {tuple(H0c.shape)}")
+    B = Y_prime.shape[0]
+    gram_b = gram.unsqueeze(0).expand(B, -1, -1)
+    G_sp = torch.bmm(Y_prime - H0c, gram_b)
+    G_ri = torch.stack((G_sp.real, G_sp.imag), dim=1)
+    out = ut.complex_1d_fft(G_ri, ifft=False, mode=fft_mode, _4d_array=False)
+    return out / float(sigma_y2)
+
+
+def gaussian_pilot_likelihood_grad_angular(
+    x_t_ri: Tensor,
+    gp_ctx: dict,
+    dm,
+    t: int,
+    sigma_y2: float,
+) -> Tensor:
+    """
+    DPS-style likelihood direction for ``Y_p = H X_p + N`` mapped to angular coordinates.
+
+    The score w.r.t. ``H`` (spatial) is proportional to ``(Y_p - H X_p)X_p^H``, i.e.
+    ``(Y' - H)C`` with ``Y' = Y_p X_p^H C^{-1}`` and ``C = X_p X_p^H`` (Mahalanobis form for
+    ``Y' = H + N'``). We return ``FFT`` of that matrix (same convention as the DM), which is the
+    direction used in angular-state DPS.
+
+    If ``gp_ctx['gaussian_likelihood_angular']`` (``N_T = N_P`` and ``X_p \\approx I``): then
+    ``(Y_p - H_0 X_p)X_p^H \\approx Y_p - H_0`` and ``FFT(Y_p - H_0) = Y_p^{ang} - x0_hat``;
+    use that fast path. For general ``X_p`` (including ``C = I`` but ``X_p \\neq I``), the full
+    spatial multiply is required; do **not** use ``Y_p^{ang} - x0_hat`` alone.
+
+    Output is scaled by ``1/sigma_y2`` like ``make_awgn_likelihood_grad``.
+    """
+    fft_mode = str(gp_ctx["fft_mode"])
+    X_p = gp_ctx["X_p"]
+    x0_hat = _tweedie_x0_hat_pred_noise(x_t_ri, dm, t)
+    s2 = float(sigma_y2)
+
+    if gp_ctx.get("gaussian_likelihood_angular"):
+        Y_p_ang = gp_ctx["Y_p_ang"].to(device=x0_hat.device, dtype=x0_hat.dtype)
+        return (Y_p_ang - x0_hat) / s2
+
+    Y_p_ri = gp_ctx["Y_p"]
+    H0_sp = ut.complex_1d_fft(x0_hat, ifft=True, mode=fft_mode, _4d_array=False)
+    if H0_sp.dim() != 4 or H0_sp.size(1) != 2:
+        raise ValueError(f"Expected H0_sp (B,2,N_R,N_T), got {tuple(H0_sp.shape)}")
+    Y_sp = torch.complex(Y_p_ri[:, 0], Y_p_ri[:, 1])
+    if Y_sp.dim() != 3:
+        raise ValueError(f"Expected Y_p_ri (B,2,N_R,N_p), got {tuple(Y_p_ri.shape)}")
+    Xp = X_p.to(device=Y_sp.device, dtype=Y_sp.dtype)
+    if Xp.dim() != 2:
+        raise ValueError("X_p must have shape (N_T, N_P)")
+    H0c = torch.complex(H0_sp[:, 0], H0_sp[:, 1])
+    B, n_r, n_t = H0c.shape
+    if Xp.shape[0] != n_t:
+        raise ValueError(f"X_p rows {Xp.shape[0]} must equal N_T={n_t} from channel")
+    Xb = Xp.unsqueeze(0).expand(B, -1, -1)
+    residual = Y_sp - torch.bmm(H0c, Xb)
+    G_sp = torch.bmm(residual, Xb.conj().transpose(-1, -2))
+    G_ri = torch.stack((G_sp.real, G_sp.imag), dim=1)
+    out = ut.complex_1d_fft(G_ri, ifft=False, mode=fft_mode, _4d_array=False)
+    return out / s2
+
+
+def angular_ls_mahalanobis_likelihood_grad_angular(
+    x_t_ri: Tensor,
+    gp_ctx: dict,
+    dm,
+    t: int,
+    sigma_y2: float,
+) -> Tensor:
+    """
+    Angular-domain LS-equivalent likelihood direction (Mahalanobis-style approximation).
+
+    Spatial model ``Y' = Y_p X_p^H (X_p X_p^H)^{-1} = H + N'`` with ``C = X_p X_p^H``.
+    After ``Y_tilde = FFT(Y')`` and ``H0_tilde = FFT(H0)`` (same ``complex_1d_fft`` as the DM),
+    use
+
+        grad_like = (Y_tilde - H0_tilde) @ C_prec_tilde,
+
+    with ``C_prec_tilde = F_tx C F_tx^H`` from ``tx_gram_spatial_to_angular(C)`` (precision-side
+    on Tx angular coordinates; **not** ``FFT(C^{-1})``).
+
+    Returns real/imag stacked tensor matching ``x_t_ri``. Scaled by ``1/sigma_y2`` like other
+    pilot branches for consistent outer DPS weighting.
+    """
+    x0_hat = _tweedie_x0_hat_pred_noise(x_t_ri, dm, t)
+    H0_tilde = torch.complex(x0_hat[:, 0], x0_hat[:, 1])
+    Y_tilde = gp_ctx["Y_tilde_c"].to(device=H0_tilde.device, dtype=H0_tilde.dtype)
+    Cprec = gp_ctx["Cprec_tilde_c"].to(device=H0_tilde.device, dtype=H0_tilde.dtype)
+    if Y_tilde.shape != H0_tilde.shape:
+        raise ValueError(f"Y_tilde {tuple(Y_tilde.shape)} vs H0_tilde {tuple(H0_tilde.shape)}")
+    B, n_r, n_t = H0_tilde.shape
+    if Cprec.dim() != 2 or Cprec.shape != (n_t, n_t):
+        raise ValueError(f"Cprec_tilde_c expected ({n_t}, {n_t}), got {tuple(Cprec.shape)}")
+    residual = Y_tilde - H0_tilde
+    Cb = Cprec.unsqueeze(0).expand(B, -1, -1)
+    G = torch.bmm(residual, Cb)
+    G_ri = torch.stack((G.real, G.imag), dim=1)
+    return G_ri / float(sigma_y2)
+
 
 def compute_cov_grad(x_ref, cov, sigma_y2):
     """
@@ -85,6 +268,64 @@ def compute_cov_grad(x_ref, cov, sigma_y2):
 
     # Return real/imag parts stacked to match x_ref layout
     return torch.stack((grad_comp.real, grad_comp.imag), dim=1)
+
+
+def compute_tx_cov_grad(x_ref: "Tensor", tau: float = 0.3) -> "Tensor":
+    """
+    Per-sample Tx Gram off-diagonal regularization with a soft-threshold (dead-zone).
+
+    Motivation
+    ----------
+    True individual H^H H matrices are NOT perfectly diagonal; they have natural 
+    off-diagonal correlation coefficients ranging roughly from 0.05 to 0.3.
+    A strict L2 penalty drives these natural correlations to 0, causing a bias.
+    This function computes the normalized correlation coefficient matrix and ONLY
+    penalizes off-diagonal entries that exceed the threshold `tau`.
+
+    Derivation
+    ----------
+    Let G = X^H X. The diagonal is D = diag(G).
+    The correlation coefficient magnitude is: C_{ij} = |G_{ij}| / sqrt(D_i D_j).
+    If C_{ij} > tau, the penalized error is the excess portion: 
+        Error_{ij} = - G_{ij} * (1 - tau / C_{ij})
+    If C_{ij} <= tau, Error_{ij} = 0.
+    
+    Gradient ∇_{X*} f ≈ 4 X @ Error (using standard Wirtinger derivative structure).
+
+    x_ref : (B, 2, N_R, N_T) real/imag tensor
+    tau   : threshold for correlation coefficient magnitude (default: 0.3)
+    Returns gradient with the same shape as x_ref.
+    """
+    if x_ref.dim() != 4 or x_ref.size(1) != 2:
+        raise ValueError("x_ref must have shape (batch, 2, N_R, N_T)")
+
+    x_comp = torch.complex(x_ref[:, 0], x_ref[:, 1])              # (B, N_R, N_T)
+    G = x_comp.conj().transpose(-1, -2) @ x_comp                   # (B, N_T, N_T)
+
+    # Extract diagonal matrix D
+    D_val = torch.diagonal(G, dim1=-2, dim2=-1).real               # (B, N_T)
+    D_mat = torch.diag_embed(torch.complex(D_val, torch.zeros_like(D_val)))
+
+    # Compute theoretical correlation denominator: sqrt(D_i * D_j)
+    D_sqrt = torch.sqrt(torch.clamp(D_val, min=1e-8))              # (B, N_T)
+    norm_matrix = D_sqrt.unsqueeze(-1) * D_sqrt.unsqueeze(-2)      # (B, N_T, N_T)
+
+    # Extract off-diagonal part of G
+    off_diag_G = G - D_mat
+
+    # Calculate correlation magnitude
+    corr_mag = off_diag_G.abs() / norm_matrix                      # (B, N_T, N_T)
+
+    # Soft-threshold factor: 1 - tau / corr_mag. 
+    # Clipped to [0, 1]. If corr_mag <= tau, factor is 0.
+    excess_factor = torch.clamp(1.0 - tau / (corr_mag + 1e-8), min=0.0)
+
+    # The error pushes the element back towards the tau boundary, not absolute zero
+    error = - (off_diag_G * excess_factor)                         # (B, N_T, N_T)
+
+    grad_comp = 4.0 * (x_comp @ error)                             # (B, N_R, N_T)
+
+    return torch.stack((grad_comp.real, grad_comp.imag), dim=1)    # (B, 2, N_R, N_T)
 
 
 def normalize_cov_grad(
@@ -174,6 +415,7 @@ class DpsSampler(object):
         likelihood_grad_fn: LikelihoodGradFn,
         dps_lambda: float = 1.0,
         cov_lambda: float = 0.0,
+        tx_cov_lambda: float = 0.0,  # ADDED parameter
         cov_scale_mode: Literal['beta_t', 'sqrt_beta_t', 'constant', 'snr_aware'] = 'beta_t',
         cov_beta_power: Optional[float] = None,
         cov_grad_norm: Literal['none', 'by_x', 'by_r', 'global'] = 'none',
@@ -196,6 +438,9 @@ class DpsSampler(object):
         like_snr_gate: bool = False,
         like_snr0_db: float = -10.5,
         like_snr_delta_db: float = 2.0,
+        dps_scale_mode: Literal['beta_t', 'sigma_eff'] = 'beta_t',
+        sigma_eff_c: float = 1.0,
+        like_clip_mode: Literal['elementwise', 'norm'] = 'norm',
     ) -> None:
         """
         Parameters
@@ -231,6 +476,10 @@ class DpsSampler(object):
             - 'auto' (default): backward-compatible behavior (elementwise for legacy beta_t path, norm otherwise)
             - 'elementwise': element-wise clamp to [-C, C]
             - 'norm': L2-norm-based scaling clip (preserves direction)
+        like_clip_mode : str
+            How to clip the DPS likelihood correction before adding to ``x_prior``:
+            - 'norm' (default): per-batch-sample L2 cap on flattened correction; same rescaling idea as ``cov_clip_mode='norm'``.
+            - 'elementwise': clamp each tensor element to ``[-step_clip, step_clip]``.
         add_random : bool
             Whether to use stochastic reverse steps (same meaning as in DMCE).
         H, sigma_y2 :
@@ -250,6 +499,7 @@ class DpsSampler(object):
             self.dps_lambda = float(dps_lambda)
 
         self.cov_lambda = float(cov_lambda)
+        self.tx_cov_lambda = float(tx_cov_lambda)
         self.cov_lambda_base = float(cov_lambda)  # Store base value for t_start scaling
         self.cov_scale_mode = cov_scale_mode
         self.cov_beta_power = None if cov_beta_power is None else float(cov_beta_power)
@@ -264,10 +514,9 @@ class DpsSampler(object):
         self.debug_history = []  # Store debug info for each timestep
 
         # Safety knobs for numerical stability
-        # Clip the final correction (not the gradient) to prevent explosion
-        # This allows strong mid-SNR updates while preventing high-SNR instability
+        # Clip the final likelihood correction (not the gradient); see like_clip_mode (norm vs elementwise).
         self.grad_clip = None        # Do NOT clip gradients (they can be large, that's OK)
-        self.step_clip = 2.0         # Clip final correction magnitude (C=1~5 recommended, using 2.0 as default)
+        self.step_clip = 2.0         # Max L2 norm per sample (norm mode) or elementwise bound (elementwise mode)
 
         # Ablation experiment key: A=baseline, B=scalar Jacobian, C=autograd gold, D=soft-gated
         self.exp_key = exp_key
@@ -300,6 +549,14 @@ class DpsSampler(object):
         self.like_snr0_db = float(like_snr0_db)
         self.like_snr_delta_db = float(like_snr_delta_db)
         self._like_gate_cached: Optional[float] = None
+        # Post-add likelihood scalar: 'beta_t' (default) vs effective-variance schedule.
+        self.dps_scale_mode = str(dps_scale_mode)
+        if self.dps_scale_mode not in ('beta_t', 'sigma_eff'):
+            raise ValueError("dps_scale_mode must be 'beta_t' or 'sigma_eff'.")
+        self.sigma_eff_c = float(sigma_eff_c)
+        self.like_clip_mode = str(like_clip_mode)
+        if self.like_clip_mode not in ('elementwise', 'norm'):
+            raise ValueError("like_clip_mode must be 'elementwise' or 'norm'.")
 
         # Extract sigma_y2 from likelihood_grad_fn closure for experiment C
         # This is needed for the autograd loss computation
@@ -342,6 +599,10 @@ class DpsSampler(object):
         # For experiments A and B, we can use no_grad context
         # For experiment C, we need gradients enabled
         if self.exp_key == 'C':
+            if getattr(self, "_gaussian_pilot_ctx", None) is not None:
+                raise NotImplementedError(
+                    "Gaussian-pilot likelihood is not implemented for exp_key='C' (autograd gold gradient)."
+                )
             # Experiment C: Autograd "gold" gradient
             # Enable gradients for x_t
             x_t_requires_grad = x_t.clone().requires_grad_(True)
@@ -671,8 +932,39 @@ class DpsSampler(object):
                     # 1) Unconditional prior reverse step
                     x_prior = self.dm.reverse_step(x_t, t, add_random=self.add_random)
 
-                    # 2) Compute likelihood gradient at the prior estimate (not at noisy x_t)
-                    if self.exp_key == 'H':
+                    # 2) Likelihood direction for guidance
+                    gp_ctx = getattr(self, "_gaussian_pilot_ctx", None)
+                    if gp_ctx is not None:
+                        if self.exp_key in ("E", "Eprime", "F", "G", "C"):
+                            raise NotImplementedError(
+                                "Spatial-pilot DPS supports exp_key in {'A','B','D','H'} only; "
+                                "closed-form variants E/E'/F/G and autograd C are unsupported."
+                            )
+                        if gp_ctx.get("pilot_likelihood_domain") == "angular_ls":
+                            grad_like_H0 = angular_ls_mahalanobis_likelihood_grad_angular(
+                                x_t,
+                                gp_ctx,
+                                self.dm,
+                                t,
+                                float(self.sigma_y2),
+                            )
+                        elif gp_ctx.get("pilot_likelihood_mode") == "nonorthogonal":
+                            grad_like_H0 = nonorthogonal_pilot_likelihood_grad_angular(
+                                x_t,
+                                gp_ctx,
+                                self.dm,
+                                t,
+                                float(self.sigma_y2),
+                            )
+                        else:
+                            grad_like_H0 = gaussian_pilot_likelihood_grad_angular(
+                                x_t,
+                                gp_ctx,
+                                self.dm,
+                                t,
+                                float(self.sigma_y2),
+                            )
+                    elif self.exp_key == 'H':
                         # ------------------------------------------------------------
                         # Exp H: "classic DPS" likelihood gradient in H_t-space.
                         #
@@ -738,40 +1030,54 @@ class DpsSampler(object):
             with torch.no_grad():
                 beta_t = self.dm.betas[t]  # scalar
                 shape_ones = (1,) * (x_prior.ndim - 1)  # broadcast over non-batch dims
+                alpha_bar_t = torch.clamp(
+                    self.dm.alphas_cumprod[t].to(x_prior.device), min=1e-12
+                )
 
-                # Optional: use beta_t**p instead of beta_t in post-add operator (A/B/C/D only).
-                # This is a lightweight knob for quick operator ablations.
-                beta_like = beta_t
-                if self.like_beta_power != 1.0 and self.exp_key in ('A', 'B', 'C', 'D', 'H'):
-                    # beta_t is positive; allow non-integer powers for experimentation.
-                    beta_like = torch.pow(beta_t, self.like_beta_power)
+                # Base scalar for likelihood correction: beta_t (default) or sigma_eff schedule.
+                # sigma_eff^2(t) = sigma_y2 + c * (1 - alpha_bar_t) inflates the denominator vs sigma_y2 alone
+                # so guidance does not explode when (1-alpha_bar_t) is large. grad_like already includes 1/sigma_y2
+                # (AWGN score), so we multiply by sigma_y2/sigma_eff^2 — net coefficient on (y - x_ref) is 1/sigma_eff^2,
+                # not 1/(sigma_y2 * sigma_eff^2).
+                if self.dps_scale_mode == 'sigma_eff':
+                    s2 = float(self.sigma_y2) if self.sigma_y2 is not None else 1.0
+                    s2_t = torch.tensor(s2, device=x_prior.device, dtype=x_prior.dtype)
+                    c_t = torch.tensor(float(self.sigma_eff_c), device=x_prior.device, dtype=x_prior.dtype)
+                    sigma_eff2 = s2_t + c_t * (1.0 - alpha_bar_t)
+                    base_scale = (s2_t / torch.clamp(sigma_eff2, min=1e-10)).view(1, *shape_ones)
+                else:
+                    beta_like = beta_t
+                    if self.like_beta_power != 1.0 and self.exp_key in ('A', 'B', 'C', 'D', 'H'):
+                        beta_like = torch.pow(beta_t, self.like_beta_power)
+                    base_scale = beta_like.view(1, *shape_ones).to(x_prior.device)
 
                 if self.exp_key == 'A':
-                    like_scalar_t = beta_like.view(1, *shape_ones)
+                    like_scalar_t = base_scale
                 elif self.exp_key == 'B':
-                    like_scalar_t = beta_like.view(1, *shape_ones)
+                    like_scalar_t = base_scale
                 elif self.exp_key == 'H':
-                    like_scalar_t = beta_like.view(1, *shape_ones)
+                    like_scalar_t = base_scale
                 elif self.exp_key == 'D':
-                    alpha_bar_t = self.dm.alphas_cumprod[t]
-                    alpha_eff = torch.clamp(alpha_bar_t, min=1e-12)
                     exponent = self.gamma - 0.5
-                    like_scalar_t = beta_like * (alpha_eff ** exponent)
-                    like_scalar_t = like_scalar_t.view(1, *shape_ones).to(x_prior.device)
+                    like_scalar_t = base_scale * torch.pow(alpha_bar_t, exponent)
                 elif self.exp_key == 'Eprime':
-                    # Diagnostic: sigma_t^2 scaling instead of beta_t
+                    # Diagnostic: sigma_t^2 scaling instead of beta_t (unchanged by dps_scale_mode).
                     a = torch.clamp(self.dm.alphas_cumprod[t].to(x_prior.device), min=1e-12)
                     sigma_t2 = ((1.0 - a) / a).view(1, *shape_ones).to(x_prior.device)
                     like_scalar_t = sigma_t2
                 else:
-                    # Experiment C: use beta_t (autograd already computed full gradient)
-                    like_scalar_t = beta_like.view(1, *shape_ones)
+                    # Experiment C: autograd gradient; same outer scalar as A (beta_t or sigma_eff schedule).
+                    like_scalar_t = base_scale
 
                 correction = self.dps_lambda * like_scalar_t * grad_like
 
                 # EXP H optional SNR-based sigmoid gate (constant per run):
                 # w_like(t, SNR_dB) = lambda_like * beta_t * gate(SNR_dB)
-                if self.exp_key == 'H' and self.like_snr_gate:
+                if (
+                    self.exp_key == 'H'
+                    and self.like_snr_gate
+                    and getattr(self, "_gaussian_pilot_ctx", None) is None
+                ):
                     gate = 1.0 if self._like_gate_cached is None else float(self._like_gate_cached)
                     gate_t = torch.tensor(gate, device=x_prior.device, dtype=x_prior.dtype).view(1, *shape_ones)
                     correction = correction * gate_t
@@ -783,7 +1089,16 @@ class DpsSampler(object):
                 grad_like_norm = torch.linalg.vector_norm(grad_like, dim=tuple(range(1, grad_like.ndim))).mean().item()
                 correction_norm = torch.linalg.vector_norm(correction, dim=tuple(range(1, correction.ndim))).mean().item()
                 
-                print(f"[DEBUG t={t}] exp_key={self.exp_key}, gamma={self.gamma if self.exp_key == 'D' else 'N/A'}")
+                print(f"[DEBUG t={t}] exp_key={self.exp_key}, gamma={self.gamma if self.exp_key == 'D' else 'N/A'}, dps_scale_mode={self.dps_scale_mode}")
+                if self.dps_scale_mode == 'sigma_eff' and self.exp_key != 'Eprime':
+                    s2d = float(self.sigma_y2) if self.sigma_y2 is not None else 1.0
+                    ab = float(self.dm.alphas_cumprod[t].item())
+                    se2 = s2d + float(self.sigma_eff_c) * (1.0 - ab)
+                    ratio = s2d / se2
+                    print(
+                        f"  sigma_eff^2={se2:.6e} (= sigma_y2 + c*(1-alpha_bar)), "
+                        f"like_scalar=sigma_y2/sigma_eff^2={ratio:.6e} (net residual scale 1/sigma_eff^2)"
+                    )
                 if alpha_bar_t_val is None:
                     print(f"  beta_t={beta_t.item():.6e}, alpha_bar_t=N/A")
                 else:
@@ -813,11 +1128,17 @@ class DpsSampler(object):
                 print(f"[DEBUG_CF Eprime t={t}] alpha_bar_t={a_val:.6e}, sigma2={sigma2_val:.6e}")
                 print(f"  ||score_like_cf||_2={g_norm:.6e}, ||like_update||_2={upd_norm:.6e}")
 
-        # 4) Clip the FINAL correction (not the gradient) to prevent explosion
-        # This allows strong mid-SNR updates while preventing high-SNR instability
-        # Using C=2.0 as default (can be tuned between 1-5)
+        # 4) Clip the FINAL likelihood correction (not the gradient): norm cap (like cov path) or elementwise.
         if self.step_clip is not None:
-            correction = torch.clamp(correction, -self.step_clip, self.step_clip)
+            if self.like_clip_mode == 'norm':
+                norm_dims_like = tuple(range(1, correction.ndim))
+                dx_norm_like = torch.linalg.vector_norm(correction, dim=norm_dims_like, keepdim=True)
+                scale_like = torch.clamp(
+                    float(self.step_clip) / (dx_norm_like + 1e-10), max=1.0
+                )
+                correction = correction * scale_like
+            else:
+                correction = torch.clamp(correction, -self.step_clip, self.step_clip)
 
         # 5) Covariance side correction with configurable scaling and normalization
         if self.cov_lambda > 0:
@@ -986,7 +1307,36 @@ class DpsSampler(object):
                 })
         else:
             correction_cov = torch.zeros_like(x_prior)
-        
+
+        # Tx covariance off-diagonal regularization:
+        # minimize ||off_diag(X^H X)||_F^2  ->  encourages column orthogonality
+        if self.tx_cov_lambda > 0:
+            with torch.no_grad():
+                _beta_tx = self.dm.betas[t].to(x_prior.device, dtype=x_prior.dtype)
+                _shape_tx = (1,) * (x_prior.ndim - 1)
+                # Reuse cov_scale_mode for consistent time-dependent scaling
+                if self.cov_scale_mode == 'sqrt_beta_t':
+                    _zeta_tx = torch.sqrt(_beta_tx + 1e-12).view(1, *_shape_tx)
+                elif self.cov_scale_mode == 'constant':
+                    _zeta_tx = torch.ones(1, *_shape_tx, device=x_prior.device, dtype=x_prior.dtype)
+                else:  # 'beta_t' (default) or 'snr_aware' fall back to beta_t
+                    _zeta_tx = _beta_tx.view(1, *_shape_tx)
+
+                _grad_tx = compute_tx_cov_grad(x_prior)
+                _corr_tx_raw = self.tx_cov_lambda * _zeta_tx * _grad_tx
+
+                # Norm-based clipping (same threshold as cov correction)
+                _clip = self.cov_step_clip if self.cov_step_clip is not None else self.step_clip
+                if _clip is not None:
+                    _nd = tuple(range(1, _corr_tx_raw.ndim))
+                    _scale = torch.clamp(
+                        _clip / (torch.linalg.vector_norm(_corr_tx_raw, dim=_nd, keepdim=True) + 1e-10),
+                        max=1.0,
+                    )
+                    correction_cov = correction_cov + _corr_tx_raw * _scale
+                else:
+                    correction_cov = correction_cov + _corr_tx_raw
+
         # Record diagnostic info if enabled
         if diagnostic_recorder is not None:
             diagnostic_recorder.record_corrections(correction, correction_cov, float(beta_t.item()))
@@ -1025,6 +1375,7 @@ class DpsSampler(object):
         snr: Optional[float] = None,
         obs_snr_db: Optional[float] = None,
         diagnostic_recorder=None,
+        t_start_override: Optional[int] = None,
     ):
         """
         Full DPS reverse loop, conditioned on observation y.
@@ -1046,6 +1397,11 @@ class DpsSampler(object):
             Signal-to-noise ratio of the observation. If provided, starts reverse
             process from the timestep that best matches this SNR (as in equation 7).
             If None, starts from the maximum timestep (T-1).
+        t_start_override : int, optional
+            If set, use this diffusion index as the first reverse step (clamped to
+            ``[0, num_timesteps-1]``), overriding SNR-matched ``t*`` (orthogonal path)
+            and ``snr_match['t_start']`` (Gaussian / nonorthogonal pilots). Does not
+            change how ``x_T`` is chosen; only the timestep schedule.
 
         Returns
         -------
@@ -1053,49 +1409,71 @@ class DpsSampler(object):
             Final posterior samples (or all intermediate samples if requested).
         """
         B = y.shape[0]
+        gp_ctx = getattr(self, "_gaussian_pilot_ctx", None)
 
-        # Cache SNR-gate for this run (EXP H only). This SNR is the observation-level SNR, constant per run.
-        if self.exp_key == 'H' and self.like_snr_gate:
-            if obs_snr_db is None:
-                # If caller doesn't provide it, fall back to snr (linear) if available.
-                if snr is not None and snr > 0:
-                    obs_snr_db = 10.0 * math.log10(float(snr))
-            if obs_snr_db is not None and self.like_snr_delta_db > 0:
-                x = (float(obs_snr_db) - self.like_snr0_db) / self.like_snr_delta_db
-                self._like_gate_cached = 1.0 / (1.0 + math.exp(-x))
+        if gp_ctx is not None:
+            self._like_gate_cached = None
+            sm = gp_ctx.get("snr_match") if isinstance(gp_ctx, dict) else None
+            if sm is not None:
+                # Spatial pilot: SNR match + init (see gaussian_pilot_snr_match; blends to orthonormal as C→I).
+                t_start = int(sm["t_start"])
+                if x_T is None:
+                    x_T = sm["x_init_ang"].to(device=y.device, dtype=y.dtype)
             else:
-                # No valid SNR information; default to no gating.
-                self._like_gate_cached = 1.0
-
-        # Determine starting timestep based on SNR matching (equation 7)
-        if snr is not None:
-            # Find timestep that best matches the observation SNR
-            # t_hat = argmin_l |SNR(Y) - SNR_DM(l)|
-            t_start = int(torch.abs(self.dm.snrs - snr).argmin())
+                # Legacy spatial pilot: full reverse chain from t=T-1, pure noise init.
+                t_start = self.dm.num_timesteps - 1
+                if x_T is None:
+                    x_T = self.dm.noise_multiplier * torch.randn(
+                        (B, *self.dm.data_shape),
+                        device=self.device,
+                        dtype=y.dtype,
+                    )
         else:
-            # Default: start from maximum timestep
-            t_start = self.dm.num_timesteps - 1
-        
-        # Store t_start info for logging (but don't apply scaling here)
-        # Scaling will be applied per-step in reverse_step_dps
-        if self.use_t_start_scaling:
-            self._last_t_start = t_start
-            self._last_beta_t_start = self.dm.betas[t_start].item()
+            # Cache SNR-gate for this run (EXP H only). This SNR is the observation-level SNR, constant per run.
+            if self.exp_key == 'H' and self.like_snr_gate:
+                if obs_snr_db is None:
+                    # If caller doesn't provide it, fall back to snr (linear) if available.
+                    if snr is not None and snr > 0:
+                        obs_snr_db = 10.0 * math.log10(float(snr))
+                if obs_snr_db is not None and self.like_snr_delta_db > 0:
+                    x = (float(obs_snr_db) - self.like_snr0_db) / self.like_snr_delta_db
+                    self._like_gate_cached = 1.0 / (1.0 + math.exp(-x))
+                else:
+                    # No valid SNR information; default to no gating.
+                    self._like_gate_cached = 1.0
 
-        if x_T is None:
-            # If starting from a specific timestep based on SNR, we should initialize
-            # from the observation y (scaled appropriately) rather than pure noise
+            # Determine starting timestep based on SNR matching (equation 7)
             if snr is not None:
-                # Normalize input data similar to generate_estimate
-                norm_multiplier = (snr / (1 + snr)) ** 0.5
-                x_T = norm_multiplier * y
+                # Find timestep that best matches the observation SNR
+                # t_hat = argmin_l |SNR(Y) - SNR_DM(l)|
+                t_start = int(torch.abs(self.dm.snrs - snr).argmin())
             else:
-                # Start from pure noise
-                x_T = self.dm.noise_multiplier * torch.randn(
-                    (B, *self.dm.data_shape),
-                    device=self.device,
-                    dtype=y.dtype,
-                )
+                # Default: start from maximum timestep
+                t_start = self.dm.num_timesteps - 1
+
+            if x_T is None:
+                # If starting from a specific timestep based on SNR, we should initialize
+                # from the observation y (scaled appropriately) rather than pure noise
+                if snr is not None:
+                    # Normalize input data similar to generate_estimate
+                    norm_multiplier = (snr / (1 + snr)) ** 0.5
+                    x_T = norm_multiplier * y
+                else:
+                    # Start from pure noise
+                    x_T = self.dm.noise_multiplier * torch.randn(
+                        (B, *self.dm.data_shape),
+                        device=self.device,
+                        dtype=y.dtype,
+                    )
+
+        if t_start_override is not None:
+            nt = int(self.dm.num_timesteps)
+            t0 = int(t_start_override)
+            t_start = max(0, min(nt - 1, t0))
+
+        # Starting diffusion index t_start (for logs / CSV); cov scaling still gated by use_t_start_scaling.
+        self._last_t_start = int(t_start)
+        self._last_beta_t_start = float(self.dm.betas[t_start].item())
 
         x_t = x_T
         if return_all_timesteps:
@@ -1189,6 +1567,20 @@ class DpsSampler(object):
         snr: Optional[float] = None,
         obs_snr_db: Optional[float] = None,
         diagnostic_recorder=None,
+        tx_cov_lambda: float = 0.0,
+        pilot_matrix_X_p: Optional[Tensor] = None,
+        y_p_spatial: Optional[Tensor] = None,
+        spatial_fft_mode: str = "2D",
+        gaussian_snr_match: bool = True,
+        gaussian_rho_linear: Optional[float] = None,
+        noise_multiplier: Optional[float] = None,
+        gaussian_eta_mode: str = "per_sample",
+        dataset_avg_trace_over_nt: Optional[float] = None,
+        gaussian_snr_match_mode: str = "trace",
+        dataset_avg_inv_lambda_min: Optional[float] = None,
+        pilot_likelihood_mode: Optional[str] = None,
+        pilot_likelihood_domain: str = "spatial",
+        t_start_override: Optional[int] = None,
     ):
         """
         Convenience wrapper mirroring DMCE API.
@@ -1200,14 +1592,158 @@ class DpsSampler(object):
         snr : float, optional
             Signal-to-noise ratio of the observation. If provided, starts reverse
             process from the timestep that best matches this SNR (equation 7).
+        pilot_matrix_X_p : Tensor, optional
+            Complex pilot matrix X_p of shape (N_T, N_P). When set with ``y_p_spatial``,
+            enables the spatial-pilot likelihood branch (Gaussian i.i.d. or nonorthogonal blend).
+        y_p_spatial : Tensor, optional
+            Spatial-domain pilot observation (B, 2, N_R, N_P) with Y_p = H X_p + N.
+        spatial_fft_mode : str
+            ``'1D'`` or ``'2D'``; must match the channel FFT convention (same as Tester mode).
+        pilot_likelihood_mode : str, optional
+            ``'gaussian'`` (default): ``(Y_p - H X_p)X_p^H`` then FFT. ``'nonorthogonal'``: precomputed
+            ``Y' = Y_p X_p^H C^{-1}`` with ``G = (Y' - H_0) C`` then FFT (same algebra, explicit ``Y'`` form).
+        pilot_likelihood_domain : str
+            ``'spatial'`` (default): existing spatial-then-FFT likelihood direction.
+            ``'angular_ls'``: form ``Y'`` in spatial domain, FFT to ``Y_tilde``, Tweedie ``H0_tilde`` in angular
+            domain, then ``(Y_tilde - H0_tilde) @ (F_tx C F_tx^H)`` with ``C = X_p X_p^H`` (see
+            ``angular_ls_mahalanobis_likelihood_grad_angular``).
+        gaussian_snr_match : bool, optional
+            If True (default), use a **heuristic** scalar ``SNR_eff`` from LS (``\\mathrm{tr}(C^{-1})``)
+            to pick ``t^*`` against isotropic ``dm.snrs`` and set ``x_T = H_{LS}^{ang}/\\sqrt{1+\\eta_{eff}^2}``.
+            This approximates colored effective noise by one number; not a rigorous statistical match
+            (see ``modules/gaussian_pilot_snr_match``).
+        gaussian_rho_linear : float, optional
+            Linear SNR rho = 10^(SNR_dB/10) for the pilot observation noise (required for snr_match).
+        noise_multiplier : float, optional
+            DM noise multiplier (must match pilot simulation).
+        gaussian_eta_mode : str, optional
+            ``per_sample`` (default) or ``dataset_avg`` (use precomputed mean ``tr(inv(gram))/N_t``).
+        dataset_avg_trace_over_nt : float, optional
+            Precomputed mean trace factor for ``dataset_avg`` mode (``snr_match_mode=trace``).
+        gaussian_snr_match_mode : str, optional
+            ``trace`` (default): legacy ``\\mathrm{tr}(C^{-1})`` heuristic; ``worst`` uses
+            ``\\sigma_{\\mathrm{eff}}^2 = \\sigma^2/\\lambda_{\\min}(C)`` and
+            ``\\mathrm{SNR}_{\\mathrm{eff}} = \\rho\\lambda_{\\min}(C)`` (see ``gaussian_pilot_snr_match``).
+        dataset_avg_inv_lambda_min : float, optional
+            Precomputed ``\\mathbb{E}[1/\\lambda_{\\min}(C)]`` for ``dataset_avg`` + ``worst`` mode.
+        t_start_override : int, optional
+            Fixed first reverse timestep index; overrides SNR-based ``t*`` (see ``reverse_loop_dps``).
         """
-        return self.reverse_loop_dps(
-            y,
-            cov=cov,
-            x_T=x_T,
-            return_all_timesteps=return_all_timesteps,
-            num_steps=num_steps,
-            snr=snr,
-            obs_snr_db=obs_snr_db,
-            diagnostic_recorder=diagnostic_recorder,
-        )
+        # Store temporary tx_cov_lambda to be used in this loop
+        old_tx_cov = getattr(self, 'tx_cov_lambda', 0.0)
+        self.tx_cov_lambda = tx_cov_lambda
+
+        old_gp = getattr(self, "_gaussian_pilot_ctx", None)
+        if pilot_matrix_X_p is not None:
+            if y_p_spatial is None:
+                raise ValueError("y_p_spatial is required when pilot_matrix_X_p is set.")
+            plm = pilot_likelihood_mode or "gaussian"
+            if plm not in ("gaussian", "nonorthogonal"):
+                raise ValueError("pilot_likelihood_mode must be 'gaussian' or 'nonorthogonal'.")
+            pld = (pilot_likelihood_domain or "spatial").strip().lower()
+            if pld not in ("spatial", "angular_ls"):
+                raise ValueError("pilot_likelihood_domain must be 'spatial' or 'angular_ls'.")
+            ctx = {
+                "X_p": pilot_matrix_X_p,
+                "Y_p": y_p_spatial,
+                "fft_mode": str(spatial_fft_mode),
+                "pilot_likelihood_mode": plm,
+                "pilot_likelihood_domain": pld,
+            }
+            ctx["Y_p_ang"] = ut.complex_1d_fft(
+                y_p_spatial, ifft=False, mode=str(spatial_fft_mode), _4d_array=False
+            )
+            _nt, _np = pilot_matrix_X_p.shape[0], pilot_matrix_X_p.shape[1]
+            _i_rect = _pm_pilot.rect_identity_complex_torch(
+                _nt, _np, pilot_matrix_X_p.device, pilot_matrix_X_p.dtype
+            )
+            # Only for legacy gaussian mode when X_p ≈ I: Y_p^ang - x0_hat shortcut.
+            ctx["gaussian_likelihood_angular"] = bool(
+                plm == "gaussian"
+                and _nt == _np
+                and torch.max(torch.abs(pilot_matrix_X_p - _i_rect)).item() < 1e-3
+                and pld == "spatial"
+            )
+            from modules.gaussian_pilot_snr_match import least_squares_channel_batch
+
+            Y_c0 = torch.complex(y_p_spatial[:, 0], y_p_spatial[:, 1])
+            if plm == "nonorthogonal":
+                ctx["Y_prime_c"] = least_squares_channel_batch(Y_c0, pilot_matrix_X_p)
+                gram0 = pilot_matrix_X_p @ pilot_matrix_X_p.conj().transpose(-1, -2)
+                eye0 = torch.eye(
+                    _nt,
+                    dtype=gram0.dtype,
+                    device=gram0.device,
+                )
+                ctx["gram_c"] = gram0 + 1e-6 * eye0
+            if pld == "angular_ls":
+                # Y' = Y_p X_p^H (X_p X_p^H)^{-1} (same LS batch as nonorthogonal ctx).
+                Y_prime_c = least_squares_channel_batch(Y_c0, pilot_matrix_X_p)
+                Yp_ri = torch.stack((Y_prime_c.real, Y_prime_c.imag), dim=1)
+                Y_tilde_ri = ut.complex_1d_fft(
+                    Yp_ri, ifft=False, mode=str(spatial_fft_mode), _4d_array=False
+                )
+                ctx["Y_tilde_c"] = torch.complex(Y_tilde_ri[:, 0], Y_tilde_ri[:, 1])
+                gram_c = pilot_matrix_X_p @ pilot_matrix_X_p.conj().transpose(-1, -2)
+                eye_c = torch.eye(_nt, dtype=gram_c.dtype, device=gram_c.device)
+                C_sp = gram_c + 1e-6 * eye_c
+                ctx["Cprec_tilde_c"] = ut.tx_gram_spatial_to_angular(C_sp)
+                # Sanity: X_p ≈ I ⇒ C ≈ I ⇒ F C F^H ≈ I (unitary similarity).
+                if (
+                    _nt == _np
+                    and float(torch.max(torch.abs(pilot_matrix_X_p - _i_rect)).item()) < 1e-3
+                ):
+                    eye_t = torch.eye(_nt, dtype=ctx["Cprec_tilde_c"].dtype, device=ctx["Cprec_tilde_c"].device)
+                    fro_rel = (
+                        torch.linalg.matrix_norm(ctx["Cprec_tilde_c"] - eye_t, ord="fro")
+                        / (float(_nt) ** 0.5 + 1e-12)
+                    )
+                    if float(fro_rel.real) > 0.05:
+                        warnings.warn(
+                            "[pilot_likelihood_domain=angular_ls] X_p is near identity but "
+                            f"||Cprec_tilde - I||_F / sqrt(N_t) = {float(fro_rel.real):.3e} is not small; "
+                            "check pilot / jitter / FFT convention."
+                        )
+            # Optional: SNR-matched timestep + LS initialization (Gaussian pilots)
+            grho = gaussian_rho_linear
+            nm = noise_multiplier
+            eta_mode = gaussian_eta_mode
+            davg = dataset_avg_trace_over_nt
+            if gaussian_snr_match and (grho is not None) and (nm is not None):
+                from modules.gaussian_pilot_snr_match import build_gaussian_snr_match
+
+                Y_c = torch.complex(y_p_spatial[:, 0], y_p_spatial[:, 1])
+                sm = build_gaussian_snr_match(
+                    Y_p_c=Y_c,
+                    X_p=pilot_matrix_X_p,
+                    rho_linear=float(grho),
+                    noise_multiplier=float(nm),
+                    dm_snrs=self.dm.snrs,
+                    spatial_fft_mode=str(spatial_fft_mode),
+                    eta_mode=str(eta_mode),
+                    dataset_avg_trace_over_nt=davg,
+                    snr_match_mode=str(gaussian_snr_match_mode),
+                    dataset_avg_inv_lambda_min=dataset_avg_inv_lambda_min,
+                )
+                ctx["snr_match"] = sm
+            self._gaussian_pilot_ctx = ctx
+        else:
+            self._gaussian_pilot_ctx = None
+
+        try:
+            res = self.reverse_loop_dps(
+                y,
+                cov=cov,
+                x_T=x_T,
+                return_all_timesteps=return_all_timesteps,
+                num_steps=num_steps,
+                snr=snr,
+                obs_snr_db=obs_snr_db,
+                diagnostic_recorder=diagnostic_recorder,
+                t_start_override=t_start_override,
+            )
+        finally:
+            self._gaussian_pilot_ctx = old_gp
+            self.tx_cov_lambda = old_tx_cov
+
+        return res

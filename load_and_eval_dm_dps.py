@@ -9,9 +9,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import os
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,6 +21,8 @@ import torch
 import DMCE
 from DMCE.utils import cmplx2real
 import modules.utils as ut
+from modules import detection as det
+from modules.pilot_matrix import draw_xp_sqrt_gamma_identity_gaussian_torch
 
 
 # --------------------------------------------------------------------------- #
@@ -51,6 +54,15 @@ def parse_args() -> argparse.Namespace:
         help='Number of reverse sampling steps. '
              'Default: None (use all steps from SNR-matched timestep down to 0, same as DM).',
     )
+    parser.add_argument(
+        '--dps_t_start',
+        type=int,
+        default=None,
+        help='Optional fixed diffusion timestep index to start the reverse chain (0 .. T-1, clamped). '
+             'When set, overrides SNR-matched t* on orthogonal pilots and heuristic t* from '
+             '--gaussian_pilot_init snr_match / --gaussian_snr_match_mode. Full chain from T-1 remains '
+             'the default when this is unset. Initialization (noise vs LS-scaled) is unchanged.',
+    )
     parser.add_argument('--return_all_timesteps', action='store_true',
                         help='Store DPS estimates for each reverse step')
     parser.add_argument('--reverse_add_random', action='store_true',
@@ -72,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.01,
         help='Strength of covariance guidance term (multiplies cov-grad correction).',
+    )
+    parser.add_argument(
+        '--tx_cov_lambda',
+        type=float,
+        default=0.0,
+        help='Strength of Tx covariance (H^H H off-diagonal) regularization term.',
     )
     parser.add_argument(
         '--cov_scale_mode',
@@ -114,6 +132,14 @@ def parse_args() -> argparse.Namespace:
              "'norm' rescales the whole update to have L2 norm <= C (preserves direction).",
     )
     parser.add_argument(
+        '--like_clip_mode',
+        type=str,
+        default='norm',
+        choices=['elementwise', 'norm'],
+        help="DPS likelihood correction clip: 'norm' (default) caps per-sample L2 norm at step_clip (same idea as cov norm clip); "
+             "'elementwise' clamps each tensor entry to [-step_clip, step_clip] (legacy).",
+    )
+    parser.add_argument(
         '--use_t_start_scaling',
         action='store_true',
         help='Enable t_start-based scaling: cov_lambda_eff = cov_lambda_base * sqrt(beta[t_start]). '
@@ -123,6 +149,123 @@ def parse_args() -> argparse.Namespace:
         '--debug_cov_scaling',
         action='store_true',
         help='Enable debug logging for cov scaling. Records per-timestep statistics to CSV.',
+    )
+    parser.add_argument(
+        '--dynamic_cov_lambda',
+        action='store_true',
+        help='Per-SNR covariance guidance strength (see --cov_lambda_schedule).',
+    )
+    parser.add_argument(
+        '--cov_lambda_schedule',
+        type=str,
+        default='sigmoid',
+        choices=['sigmoid', 'linear', 'plateau_linear', 'pilot_table'],
+        help='With --dynamic_cov_lambda: '
+             '"sigmoid" = min+(max-min)*σ((SNR-snr0)/δ) (asymptotic min/max; low SNR is still above min). '
+             '"linear" = exact min at linear_snr_min, exact max at linear_snr_max. '
+             '"plateau_linear" = hold min for SNR ≤ plateau_upto, then linear ramp to max at linear_snr_max '
+             '(keeps ultralow-SNR cov weak; good when sigmoid lifts cov too early). '
+             '"pilot_table" = SNR knot table from modules/spatial_pilot_schedule_g*.py, chosen by '
+             '--spatial_pilot_gamma ∈ {0, 0.5, 1} (gaussian pilot_mode uses γ=0 table). '
+             'Cov λ: linear in log(λ) vs SNR, then exp.',
+    )
+    parser.add_argument(
+        '--cov_lambda_min',
+        type=float,
+        default=0.01,
+        help='With --dynamic_cov_lambda: floor of the schedule (see --cov_lambda_schedule).',
+    )
+    parser.add_argument(
+        '--cov_lambda_max',
+        type=float,
+        default=0.05,
+        help='With --dynamic_cov_lambda: ceiling of the schedule (see --cov_lambda_schedule).',
+    )
+    parser.add_argument(
+        '--cov_lambda_snr0_db',
+        type=float,
+        default=-5.0,
+        help='With --dynamic_cov_lambda and sigmoid: logistic midpoint in dB (default -5).',
+    )
+    parser.add_argument(
+        '--cov_lambda_delta_db',
+        type=float,
+        default=3.0,
+        help='With --dynamic_cov_lambda and sigmoid: logistic width in dB (default 2).',
+    )
+    parser.add_argument(
+        '--cov_lambda_linear_snr_min_db',
+        type=float,
+        default=-15.0,
+        help='With --dynamic_cov_lambda and linear: SNR (dB) at which cov_lambda equals cov_lambda_min (default -15).',
+    )
+    parser.add_argument(
+        '--cov_lambda_linear_snr_max_db',
+        type=float,
+        default=5.0,
+        help='With --dynamic_cov_lambda and linear or plateau_linear: SNR (dB) at which cov_lambda equals cov_lambda_max (default 5).',
+    )
+    parser.add_argument(
+        '--cov_lambda_plateau_upto_db',
+        type=float,
+        default=-10.0,
+        help='With --dynamic_cov_lambda and plateau_linear: cov_lambda = cov_lambda_min for all SNR ≤ this (dB); '
+             'ramp runs from this level to --cov_lambda_linear_snr_max_db (default -10).',
+    )
+    parser.add_argument(
+        '--dynamic_dps_lambda',
+        action='store_true',
+        help='Per-SNR DPS likelihood strength (see --dps_lambda_schedule: sigmoid, linear, or pilot_table). '
+             'Motivation: fixed lambda tends to plateau; smaller lambda helps low SNR, larger helps high SNR.',
+    )
+    parser.add_argument(
+        '--dps_lambda_min',
+        type=float,
+        default=0.05,
+        help='With --dynamic_dps_lambda: λ at dps_lambda_linear_snr_min_db (linear) or low-SNR side of sigmoid '
+             '(default 0.05). May be greater than --dps_lambda_max if λ should decrease with SNR.',
+    )
+    parser.add_argument(
+        '--dps_lambda_max',
+        type=float,
+        default=0.2,
+        help='With --dynamic_dps_lambda: λ at dps_lambda_linear_snr_max_db (linear) or high-SNR side of sigmoid '
+             '(default 0.2).',
+    )
+    parser.add_argument(
+        '--dps_lambda_snr0_db',
+        type=float,
+        default=-5.0,
+        help='With --dynamic_dps_lambda and sigmoid schedule only: logistic midpoint in dB (default -5).',
+    )
+    parser.add_argument(
+        '--dps_lambda_delta_db',
+        type=float,
+        default=3.0,
+        help='With --dynamic_dps_lambda and sigmoid schedule only: logistic width in dB (default 3).',
+    )
+    parser.add_argument(
+        '--dps_lambda_linear_snr_min_db',
+        type=float,
+        default=-15.0,
+        help='With --dynamic_dps_lambda and linear: SNR (dB) at which dps_lambda equals dps_lambda_min (default -15).',
+    )
+    parser.add_argument(
+        '--dps_lambda_linear_snr_max_db',
+        type=float,
+        default=5.0,
+        help='With --dynamic_dps_lambda and linear: SNR (dB) at which dps_lambda equals dps_lambda_max (default 5).',
+    )
+    parser.add_argument(
+        '--dps_lambda_schedule',
+        type=str,
+        default='sigmoid',
+        choices=['sigmoid', 'linear', 'pilot_table'],
+        help='With --dynamic_dps_lambda: "sigmoid" uses min/max/snr0/delta; '
+             '"linear" uses exact min at dps_lambda_linear_snr_min_db and max at _max_db; '
+             '"pilot_table" uses modules/spatial_pilot_schedule_g*.py (picked by --spatial_pilot_gamma '
+             '∈ {0, 0.5, 1}; gaussian pilot_mode → γ=0 table). With --method dps use DM knot column; '
+             'with dps_cov_* use DPS+COV knots.',
     )
     parser.add_argument(
         '--n_time_samples',
@@ -139,12 +282,114 @@ def parse_args() -> argparse.Namespace:
              'must mirror experiments/test_HHt_estimator.py.',
     )
     parser.add_argument(
+        '--compute_ser',
+        action='store_true',
+        help='Also compute SER via MMSE detection using the channel estimate H_hat at each SNR. '
+             'Data model: Y_d = H X + N, X is i.i.d. 4QAM/QPSK by default.',
+    )
+    parser.add_argument(
+        '--n_data_symbols',
+        type=int,
+        default=256,
+        help='Number of data symbols per stream for SER evaluation (per batch element).',
+    )
+    parser.add_argument(
+        '--det_modulation',
+        type=str,
+        default='4qam',
+        choices=['4qam', 'qpsk', 'bpsk', '4-qam'],
+        help='Constellation used for SER evaluation. Note: 4QAM is equivalent to QPSK.',
+    )
+    parser.add_argument(
         '--ch_type',
         type=str,
         default='3gpp',
-        choices=['3gpp', 'quadriga_LOS'],
-        help='Channel type: "3gpp" (default) or "quadriga_LOS". '
-             'Must match the available best_models_dm_paper subfolder.',
+        choices=['3gpp', 'quadriga_LOS', 'pseudo_multiuser_3gpp'],
+        help='Channel type: "3gpp" (default), "quadriga_LOS", or "pseudo_multiuser_3gpp".',
+    )
+    parser.add_argument(
+        '--pilot_mode',
+        type=str,
+        default='orthogonal',
+        choices=['orthogonal', 'gaussian', 'nonorthogonal'],
+        help='orthogonal: y ≈ H + AWGN in angular domain (default). '
+             'gaussian: Y_p = H X_p + AWGN with X_p i.i.d. complex Gaussian (legacy, no γ blend). '
+             'nonorthogonal: X_p = sqrt(γ) I_rect + sqrt(1-γ) G (--spatial_pilot_gamma); '
+             'likelihood uses Y\' = Y_p X_p^H (X_p X_p^H)^{-1} and G=(Y\'-H_0)C then FFT.',
+    )
+    parser.add_argument(
+        '--n_pilot',
+        type=int,
+        default=16,
+        help='N_p for --pilot_mode gaussian or nonorthogonal (X_p is N_T x N_p).',
+    )
+    parser.add_argument(
+        '--pilot_power_norm',
+        type=str,
+        default='legacy',
+        choices=['legacy', 'align_i', 'row_norm'],
+        help='Power normalization for gaussian/nonorthogonal pilots. '
+             '"legacy": keep historical scaling (backward compatible). '
+             '"align_i": scale Gaussian part so that E[G G^H] = I (matches identity pilot power). '
+             '"row_norm": same as align_i then L2-normalize each row of final X_p.',
+    )
+    parser.add_argument(
+        '--spatial_pilot_gamma',
+        type=float,
+        default=0.0,
+        help='nonorthogonal only: γ in [0,1] for X_p = sqrt(γ)*I_rect + sqrt(1-γ)*G. Ignored for gaussian (pure G).',
+    )
+    parser.add_argument(
+        '--pilot_likelihood_domain',
+        type=str,
+        default='spatial',
+        choices=['spatial', 'angular_ls'],
+        help='gaussian/nonorthogonal only: spatial = existing (Y_p-HX_p)X_p^H or (Y\'-H)C then FFT; '
+             'angular_ls = LS Y\' then FFT(Y\'), Tweedie H0 in angular, grad ∝ (Y_tilde-H0_tilde)@(F_tx C F_tx^H).',
+    )
+    parser.add_argument(
+        '--gaussian_pilot_seed',
+        type=int,
+        default=None,
+        help='Optional RNG seed for drawing X_p per batch in gaussian/nonorthogonal modes (adds batch_idx).',
+    )
+    parser.add_argument(
+        '--gaussian_pilot_init',
+        type=str,
+        default='snr_match',
+        choices=['snr_match', 'noise'],
+        help='gaussian/nonorthogonal: snr_match = heuristic SNR_eff from tr(inv(gram))/N_t, '
+             'match t* to dm.snrs, init x_T = H_LS_ang/sqrt(1+eta_eff^2) (approximate). '
+             'noise = full chain from t=T-1 with pure noise init.',
+    )
+    parser.add_argument(
+        '--gaussian_eta_mode',
+        type=str,
+        default='per_sample',
+        choices=['per_sample', 'dataset_avg'],
+        help='How to compute heuristic eta_eff^2: per_sample uses tr(inv(gram))/N_t for this X_p; '
+             'dataset_avg uses a precomputed Monte Carlo mean (faster, see --gaussian_dataset_avg_n).',
+    )
+    parser.add_argument(
+        '--gaussian_snr_match_mode',
+        type=str,
+        default='trace',
+        choices=['trace', 'worst'],
+        help='When --gaussian_pilot_init snr_match: trace = legacy SNR_eff from tr(C^{-1}) (default); '
+             'worst = sigma_eff^2 = sigma2/lambda_min(C), SNR_eff = rho*lambda_min(C), C=X_p X_p^H; '
+             'C and lambda_min computed once per sample (cached in snr_match dict).',
+    )
+    parser.add_argument(
+        '--gaussian_dataset_avg_n',
+        type=int,
+        default=512,
+        help='Number of random pilot draws for --gaussian_eta_mode dataset_avg (one-time per run).',
+    )
+    parser.add_argument(
+        '--model_path',
+        type=str,
+        default=None,
+        help='Explicit path to the directory containing the model (e.g. results/2026-03-10-18h39m11s). If not provided, defaults to results/best_models_dm_paper/...',
     )
     parser.add_argument(
         '--n_path',
@@ -158,11 +403,35 @@ def parse_args() -> argparse.Namespace:
         help='Use sanity check SNR range: [-15, -10, -5, 0, 5] instead of full range.',
     )
     parser.add_argument(
+        '--ultra_low_snrs',
+        action='store_true',
+        help='Use ultra-low SNR range: [-15, -14, -13, -12, -11] (step 1) instead of full range.',
+    )
+    parser.add_argument(
         '--single_snr_db',
         type=float,
         default=None,
         help='If set, evaluate only this single SNR point (in dB), e.g. --single_snr_db -15. '
-             'This overrides --sanity_snrs and the default full sweep.',
+             'This overrides --ultra_low_snrs, --sanity_snrs, --snr_min/--snr_max/--snr_step.',
+    )
+    parser.add_argument(
+        '--snr_min',
+        type=float,
+        default=-15.0,
+        help='Start of SNR sweep (dB) when not using --single_snr_db, --sanity_snrs, or --ultra_low_snrs '
+             '(same pattern as run_gram_oracle_3gpp_nmse.py).',
+    )
+    parser.add_argument(
+        '--snr_max',
+        type=float,
+        default=5.0,
+        help='End of SNR sweep (dB), inclusive (uses snr_max + 1e-9 in arange, like gram oracle).',
+    )
+    parser.add_argument(
+        '--snr_step',
+        type=float,
+        default=1.0,
+        help='Step between SNR points (dB). Default 1 reproduces the previous [-15,..,5] sweep.',
     )
     parser.add_argument(
         '--record_diagnostics',
@@ -239,6 +508,12 @@ def parse_args() -> argparse.Namespace:
              "By default, ablations disable SNR matching to use the full reverse chain.",
     )
     parser.add_argument(
+        '--no_h_snr_match',
+        action='store_true',
+        help="EXP H only (orthogonal pilots): do not pass observation SNR into the reverse loop, so sampling "
+             "starts from t=T-1 with pure-noise init like other ablations. Default for H is SNR-matched t*.",
+    )
+    parser.add_argument(
         '--like_weight',
         type=float,
         default=1.0,
@@ -287,6 +562,21 @@ def parse_args() -> argparse.Namespace:
         help='Ablation knob for post-add DPS (exp A/B/C/D only): replace beta_t with beta_t**p in the likelihood correction operator. '
              'Default: 1.0 (no change). Example: p=2.0 tests beta_t^2.',
     )
+    parser.add_argument(
+        '--dps_scale_mode',
+        type=str,
+        default='beta_t',
+        choices=['beta_t', 'sigma_eff'],
+        help='Likelihood post-add scalar only: beta_t = default DDPS-style beta_t (and like_beta_power); '
+             'sigma_eff = multiply AWGN grad_like by sigma_y2/sigma_eff^2 with sigma_eff^2 = sigma_y2 + sigma_eff_c*(1-alpha_bar_t) '
+             'so the net residual coefficient is 1/sigma_eff^2 (exp A/B/C/D/H; Eprime unchanged).',
+    )
+    parser.add_argument(
+        '--sigma_eff_c',
+        type=float,
+        default=1.0,
+        help='Coefficient c in sigma_eff^2 = sigma_y2 + c*(1-alpha_bar_t) when --dps_scale_mode sigma_eff.',
+    )
     args = parser.parse_args()
     
     # Parse lambda values
@@ -321,13 +611,13 @@ def prepare_test_data(ch_type: str,
     )
     del _
 
-    if ch_type.startswith('3gpp') and n_dim2 > 1:
+    if (ch_type.startswith('3gpp') or ch_type.startswith('pseudo')) and n_dim2 > 1:
         data_test = np.reshape(data_test, (-1, n_dim, n_dim2), order='F')
 
     data_test = torch.from_numpy(np.asarray(data_test[:, None, :]))
     data_test = cmplx2real(data_test, dim=1, new_dim=False).float()
 
-    if ch_type.startswith('3gpp'):
+    if ch_type.startswith('3gpp') or ch_type.startswith('pseudo'):
         ch_type = f'{ch_type}_path={n_path}'
 
     return data_test, ch_type
@@ -361,7 +651,7 @@ def build_tester(model: DMCE.DiffusionModel,
                  dps_lambda: float,
                  sigma_y2: float) -> DMCE.Tester:
     tester_cfg = dict(
-        batch_size=512,
+        batch_size=256,  # 降低 batch size 防止显存碎片化死锁
         criteria=['nmse'],
         complex_data=False,
         return_all_timesteps=return_all_timesteps,
@@ -377,12 +667,165 @@ def build_tester(model: DMCE.DiffusionModel,
     return DMCE.Tester(model, data=data, **tester_cfg)
 
 
+# Linux ext4 NAME_MAX is 255 bytes for a single filename; long DPS suffixes can exceed it (Errno 36).
+_MAX_EXPORT_BASENAME_BYTES = 220
+
+
+def short_ch_type_for_export_fname(ch_type: str) -> str:
+    """Short channel id for result CSV filenames."""
+    if ch_type.startswith('pseudo_multiuser_3gpp'):
+        rest = ch_type[len('pseudo_multiuser_3gpp') :].lstrip('_')
+        rest = rest.replace('path=', 'p').replace('=', '')
+        return f'pm3g_{rest}'[:36]
+    if ch_type.startswith('pseudo_multiuser'):
+        rest = ch_type[len('pseudo_multiuser') :].lstrip('_').replace('path=', 'p').replace('=', '')
+        return f'pmu_{rest}'[:36]
+    if ch_type.startswith('3gpp'):
+        rest = ch_type[4:].lstrip('_').replace('path=', 'p').replace('=', '')
+        return f'3g_{rest}'[:36]
+    return ch_type.replace('=', '')[:36]
+
+
+def cov_scale_slug_for_export(mode: str) -> str:
+    return (
+        str(mode)
+        .replace('sqrt_beta_t', 'sbt')
+        .replace('beta_t', 'bt')
+        .replace('identity', 'id')
+    )
+
+
+def build_dps_export_prefix(
+    ch_type: str,
+    n_dim: int,
+    n_dim2: int,
+    num_val: int,
+    num_timesteps: int,
+    ts: Optional[str] = None,
+) -> str:
+    if ts is None:
+        ts = dt.datetime.now().strftime('%y%m%d_%H%M%S')
+    ch = short_ch_type_for_export_fname(ch_type)
+    if num_val >= 1000 and num_val % 1000 == 0:
+        vs = f'{num_val // 1000}k'
+    else:
+        vs = str(num_val)
+    return f'{ts}_{ch}_{n_dim}x{n_dim2}_v{vs}_T{num_timesteps}'
+
+
+def build_dps_export_suffix(
+    args,
+    method_name: str,
+    dps_lambda: float,
+    *,
+    comparison: bool = False,
+) -> str:
+    """Compact _suffix for CSV export (replaces long key=value tokens)."""
+    slug = {
+        'DPS': 'dps',
+        'DPS_COV_ORACLE': 'dco',
+        'DPS_COV_EST': 'dce',
+    }.get(method_name, method_name[:8].lower())
+    parts: List[str] = [slug]
+    if comparison:
+        parts.append('allL')
+    else:
+        if args.dynamic_dps_lambda and args.dps_lambda_schedule == 'pilot_table':
+            parts.append('dlpt')
+        elif args.dynamic_dps_lambda and args.dps_lambda_schedule == 'linear':
+            parts.append('dllin')
+        else:
+            parts.append(f'dl{dps_lambda:g}')
+    parts.append(f'sy{args.sigma_y2:g}')
+    if getattr(args, 'dps_scale_mode', 'beta_t') == 'sigma_eff':
+        parts.append(f'sef{args.sigma_eff_c:g}')
+    if args.dynamic_dps_lambda:
+        if args.dps_lambda_schedule == 'pilot_table':
+            parts.append('ddpt')
+        elif args.dps_lambda_schedule == 'linear':
+            parts.append(
+                f'ddl{args.dps_lambda_min:g}-{args.dps_lambda_max:g}_'
+                f'{args.dps_lambda_linear_snr_min_db:g}t{args.dps_lambda_linear_snr_max_db:g}'
+            )
+        else:
+            parts.append(
+                f'dd{args.dps_lambda_min:g}-{args.dps_lambda_max:g}_s{args.dps_lambda_snr0_db:g}d{args.dps_lambda_delta_db:g}'
+            )
+    if args.pilot_mode == 'gaussian':
+        parts.append(f'pg{args.n_pilot}')
+    elif args.pilot_mode == 'nonorthogonal':
+        parts.append(f'pn{args.n_pilot}g{args.spatial_pilot_gamma:g}')
+    if args.method in ('dps_cov_oracle', 'dps_cov_est'):
+        if args.dynamic_cov_lambda:
+            if args.cov_lambda_schedule == 'linear':
+                parts.append(
+                    f'dcl{args.cov_lambda_min:g}-{args.cov_lambda_max:g}_'
+                    f'{args.cov_lambda_linear_snr_min_db:g}t{args.cov_lambda_linear_snr_max_db:g}'
+                )
+            elif args.cov_lambda_schedule == 'plateau_linear':
+                parts.append(
+                    f'dcp{args.cov_lambda_min:g}-{args.cov_lambda_max:g}_'
+                    f'p{args.cov_lambda_plateau_upto_db:g}t{args.cov_lambda_linear_snr_max_db:g}'
+                )
+            elif args.cov_lambda_schedule == 'pilot_table':
+                parts.append('dcpt')
+            else:
+                parts.append(
+                    f'dcs{args.cov_lambda_min:g}-{args.cov_lambda_max:g}_'
+                    f's{args.cov_lambda_snr0_db:g}d{args.cov_lambda_delta_db:g}'
+                )
+        else:
+            parts.append(f'cl{args.cov_lambda:g}')
+        if args.cov_beta_power is not None:
+            parts.append(f'bp{args.cov_beta_power:g}')
+        else:
+            parts.append(f'sc{cov_scale_slug_for_export(args.cov_scale_mode)}')
+        parts.append(f'cp{args.cov_clip_mode}')
+        if args.use_t_start_scaling:
+            parts.append('ts')
+    if args.method == 'dps_cov_est':
+        parts.append(f'nt{args.n_time_samples}_{args.modulation}')
+    if args.exp_key != 'A':
+        parts.append(f'e{args.exp_key}')
+        if args.exp_key == 'D':
+            parts.append(f'g{args.gamma:.2f}')
+        elif args.exp_key == 'E':
+            parts.append('cf')
+        elif args.exp_key == 'Eprime':
+            parts.append('cfpa')
+        elif args.exp_key == 'F':
+            parts.append('pap')
+    return '_' + '_'.join(parts)
+
+
+def _export_csv_path(base_dir: Path, stem: str) -> Path:
+    """
+    Return base_dir / f'{stem}.csv', shortening to SHA256-based name if the basename is too long.
+    When shortened, writes base_dir / '<sha256>.stem.txt' with the full stem (one line) for recovery.
+    """
+    ext = '.csv'
+    name = f'{stem}{ext}'
+    name_b = name.encode('utf-8')
+    if len(name_b) <= _MAX_EXPORT_BASENAME_BYTES:
+        return base_dir / name
+    digest = hashlib.sha256(name_b).hexdigest()
+    side = base_dir / f'{digest}.stem.txt'
+    side.write_text(stem + '\n', encoding='utf-8')
+    return base_dir / f'{digest}{ext}'
+
+
 def export_table(base_dir: Path,
                  prefix: str,
                  headers: Sequence[str],
                  rows: Sequence[Sequence],
                  suffix: str) -> None:
-    path = base_dir / f'{prefix}{suffix}.csv'
+    stem = f'{prefix}{suffix}'
+    path = _export_csv_path(base_dir, stem)
+    if path.name != f'{stem}.csv':
+        print(
+            f'[export_table] Basename length {len(stem.encode("utf-8")) + len(".csv")} bytes '
+            f'exceeds safe limit; saved as {path.name} (full stem in {path.stem}.stem.txt).'
+        )
     with open(path, 'w', newline='') as f:
         csv.writer(f, lineterminator='\n').writerows([headers, *rows])
 
@@ -951,7 +1394,12 @@ def main() -> None:
     )
 
     cwd = Path(os.getcwd())
-    model_dir = cwd / 'results/best_models_dm_paper' / ch_type
+    if args.model_path is not None:
+        model_dir = cwd / args.model_path
+    else:
+        model_dir = cwd / 'results/best_models_dm_paper' / ch_type
+    
+    print(f"Loading model from: {model_dir}")
     diffusion_model, sim_params = load_diffusion_model(model_dir, device)
 
     # Initialize tester with first lambda value (will be updated in loop)
@@ -966,33 +1414,172 @@ def main() -> None:
 
     diffusion_model.reverse_add_random = args.reverse_add_random
     
-    # SNR range: -15 to 5 dB, step 1 (or custom range for sanity check / single point)
+    # SNR range: configurable (--snr_min/max/step) or presets / single point
     if args.single_snr_db is not None:
         target_snrs = [float(args.single_snr_db)]
+    elif args.ultra_low_snrs:
+        target_snrs = list(range(-15, -10, 1))  # [-15, -14, -13, -12, -11]
     elif args.sanity_snrs:
         target_snrs = [-15, -10, -5, 0, 5]
     else:
-        target_snrs = list(range(-15, 6, 1))
+        smin, smax, sstep = float(args.snr_min), float(args.snr_max), float(args.snr_step)
+        if sstep <= 0:
+            raise ValueError("--snr_step must be positive")
+        if smin > smax + 1e-12:
+            raise ValueError("--snr_min must be <= --snr_max")
+        target_snrs = np.arange(smin, smax + 1e-9, sstep, dtype=float).tolist()
+        if not target_snrs:
+            raise ValueError("SNR grid is empty; check --snr_min, --snr_max, --snr_step")
     
     # Test multiple lambda values
     print(f"\n{'='*60}")
     print(f"Testing {len(args.dps_lambdas)} lambda value(s): {args.dps_lambdas}")
     print(f"SNR range: {target_snrs} dB")
     print(f"Method: {args.method}")
+    print(
+        f"Pilot mode: {args.pilot_mode}"
+        + (
+            f" (N_p={args.n_pilot}, spatial_pilot_gamma={args.spatial_pilot_gamma:g})"
+            if args.pilot_mode == 'nonorthogonal'
+            else (f" (N_p={args.n_pilot})" if args.pilot_mode == 'gaussian' else '')
+        )
+        + (
+            f", pilot_likelihood_domain={args.pilot_likelihood_domain}"
+            if args.pilot_mode in ('gaussian', 'nonorthogonal')
+            else ''
+        )
+    )
+    if args.pilot_mode in ('gaussian', 'nonorthogonal') and args.exp_key not in ('A', 'B', 'D', 'H'):
+        raise ValueError(
+            "gaussian/nonorthogonal pilot likelihood supports exp_key A, B, D, or H only "
+            "(E/E'/F/G/C are unsupported)."
+        )
+    if args.pilot_mode == 'nonorthogonal' and not (0.0 <= float(args.spatial_pilot_gamma) <= 1.0):
+        raise ValueError("--spatial_pilot_gamma must be in [0, 1] for --pilot_mode nonorthogonal.")
+    if args.dps_lambda_schedule == 'pilot_table' or (
+        args.dynamic_cov_lambda and args.cov_lambda_schedule == 'pilot_table'
+    ):
+        from modules.spatial_pilot_schedule_loader import (
+            effective_spatial_gamma_for_pilot_table,
+            normalize_spatial_pilot_gamma,
+        )
+
+        normalize_spatial_pilot_gamma(
+            effective_spatial_gamma_for_pilot_table(args.pilot_mode, args.spatial_pilot_gamma)
+        )
+    if args.dynamic_cov_lambda:
+        if args.cov_lambda_schedule == 'sigmoid':
+            if float(args.cov_lambda_delta_db) == 0.0:
+                raise ValueError("--cov_lambda_delta_db must be non-zero for --cov_lambda_schedule sigmoid.")
+        elif args.cov_lambda_schedule == 'linear':
+            lo = float(args.cov_lambda_linear_snr_min_db)
+            hi = float(args.cov_lambda_linear_snr_max_db)
+            if lo >= hi:
+                raise ValueError(
+                    "--cov_lambda_linear_snr_min_db must be < --cov_lambda_linear_snr_max_db for linear schedule."
+                )
+        elif args.cov_lambda_schedule == 'plateau_linear':
+            pu = float(args.cov_lambda_plateau_upto_db)
+            hi = float(args.cov_lambda_linear_snr_max_db)
+            if pu >= hi:
+                raise ValueError(
+                    "--cov_lambda_plateau_upto_db must be < --cov_lambda_linear_snr_max_db for plateau_linear."
+                )
+        elif args.cov_lambda_schedule == 'pilot_table':
+            pass
+        if args.cov_lambda_schedule != 'pilot_table' and float(args.cov_lambda_min) > float(args.cov_lambda_max):
+            raise ValueError("--cov_lambda_min must be <= --cov_lambda_max for --dynamic_cov_lambda.")
+    if args.cov_lambda_schedule == 'pilot_table' and not args.dynamic_cov_lambda:
+        raise ValueError("--cov_lambda_schedule pilot_table requires --dynamic_cov_lambda.")
+    if args.dps_lambda_schedule == 'pilot_table' and not args.dynamic_dps_lambda:
+        raise ValueError("--dps_lambda_schedule pilot_table requires --dynamic_dps_lambda.")
+    if args.dps_lambda_schedule == 'linear' and not args.dynamic_dps_lambda:
+        raise ValueError("--dps_lambda_schedule linear requires --dynamic_dps_lambda.")
+    if args.dynamic_dps_lambda and args.dps_lambda_schedule == 'sigmoid':
+        if float(args.dps_lambda_delta_db) == 0.0:
+            raise ValueError("--dps_lambda_delta_db must be non-zero for --dps_lambda_schedule sigmoid.")
+    if args.dynamic_dps_lambda and args.dps_lambda_schedule == 'linear':
+        _dlo = float(args.dps_lambda_linear_snr_min_db)
+        _dhi = float(args.dps_lambda_linear_snr_max_db)
+        if _dlo >= _dhi:
+            raise ValueError(
+                "--dps_lambda_linear_snr_min_db must be < --dps_lambda_linear_snr_max_db for linear DPS schedule."
+            )
     if args.method in ('dps_cov_oracle', 'dps_cov_est'):
         print(f"Cov scale mode: {args.cov_scale_mode}")
         if args.cov_beta_power is not None:
             print(f"Cov beta power override: {args.cov_beta_power}   (zeta_t = beta_t**p)")
         print(f"Cov grad norm: {args.cov_grad_norm}")
-        print(f"Cov lambda: {args.cov_lambda}")
+        if args.dynamic_cov_lambda:
+            if args.cov_lambda_schedule == 'linear':
+                print(
+                    "Cov lambda: DYNAMIC linear "
+                    f"{args.cov_lambda_min:g}..{args.cov_lambda_max:g} "
+                    f"over SNR [{args.cov_lambda_linear_snr_min_db:g}, {args.cov_lambda_linear_snr_max_db:g}] dB"
+                )
+            elif args.cov_lambda_schedule == 'plateau_linear':
+                print(
+                    "Cov lambda: DYNAMIC plateau+linear "
+                    f"{args.cov_lambda_min:g} for SNR ≤ {args.cov_lambda_plateau_upto_db:g} dB, "
+                    f"then ramp to {args.cov_lambda_max:g} at {args.cov_lambda_linear_snr_max_db:g} dB"
+                )
+            elif args.cov_lambda_schedule == 'pilot_table':
+                print(
+                    "Cov lambda: DYNAMIC pilot_table — log(λ) linear in SNR, then exp "
+                    "(spatial_pilot_schedule_g* by --spatial_pilot_gamma; gaussian mode → γ=0 table)"
+                )
+            else:
+                print(
+                    "Cov lambda: DYNAMIC sigmoid "
+                    f"{args.cov_lambda_min:g}..{args.cov_lambda_max:g} "
+                    f"(snr0={args.cov_lambda_snr0_db:g} dB, delta={args.cov_lambda_delta_db:g} dB; "
+                    "min/max are asymptotic, not exact at sweep edges)"
+                )
+        else:
+            print(f"Cov lambda: {args.cov_lambda}")
         print(f"Cov step clip: {args.cov_step_clip}")
         print(f"Cov clip mode: {args.cov_clip_mode}")
+    if args.dynamic_dps_lambda:
+        if args.dps_lambda_schedule == 'pilot_table':
+            if args.method == 'dps':
+                print(
+                    "DPS lambda: DYNAMIC pilot_table piecewise-linear, DM knots "
+                    "(spatial_pilot_schedule_g* by --spatial_pilot_gamma)"
+                )
+            else:
+                print(
+                    "DPS lambda: DYNAMIC pilot_table piecewise-linear, DPS+COV knots "
+                    "(spatial_pilot_schedule_g* by --spatial_pilot_gamma)"
+                )
+        elif args.dps_lambda_schedule == 'linear':
+            print(
+                "DPS lambda: DYNAMIC linear "
+                f"{args.dps_lambda_min:g}..{args.dps_lambda_max:g} "
+                f"over SNR [{args.dps_lambda_linear_snr_min_db:g}, {args.dps_lambda_linear_snr_max_db:g}] dB"
+            )
+        else:
+            print(
+                "DPS lambda: DYNAMIC sigmoid "
+                f"{args.dps_lambda_min:g}..{args.dps_lambda_max:g} "
+                f"(snr0={args.dps_lambda_snr0_db:g} dB, delta={args.dps_lambda_delta_db:g} dB)"
+            )
     if args.use_fixed_sigma_y2:
         print(f"Likelihood sigma_y2: FIXED ({args.sigma_y2})")
     else:
         print("Likelihood sigma_y2: SNR-derived (matches functional.awgn)")
-        if args.use_t_start_scaling:
-            print(f"Per-step scaling: ENABLED (cov_lambda_eff(t) = cov_lambda_base * sqrt(beta[t]) for each step)")
+    if args.dps_scale_mode == 'sigma_eff':
+        print(
+            f"DPS likelihood post-add scalar: sigma_eff with c={args.sigma_eff_c:g} "
+            "(like_scalar = sigma_y2/sigma_eff^2, sigma_eff^2 = sigma_y2 + c*(1-alpha_bar_t); "
+            "exp Eprime unchanged; --like_beta_power ignored)."
+        )
+    if args.method in ('dps', 'dps_cov_oracle', 'dps_cov_est'):
+        print(
+            f"DPS likelihood clip: {args.like_clip_mode} "
+            "(threshold = DpsSampler.step_clip, default 2.0; norm = per-sample L2 cap like cov)."
+        )
+    if args.use_t_start_scaling:
+        print(f"Per-step scaling: ENABLED (cov_lambda_eff(t) = cov_lambda_base * sqrt(beta[t]) for each step)")
     if args.num_steps is None:
         print("Number of reverse steps: None (use all steps from SNR-matched timestep to 0)")
     else:
@@ -1037,7 +1624,7 @@ def main() -> None:
     
     # Custom test function that uses specified SNR range
     def custom_test_nmse():
-        """Custom _test_nmse that tests SNR -15 to 5 dB (step 1)"""
+        """Custom _test_nmse over `target_snrs` (CLI SNR grid or presets)."""
         # Copy the original method but modify SNR range
         import time
         from tqdm import tqdm
@@ -1045,7 +1632,7 @@ def main() -> None:
         import modules.utils as ut
         
         # DEBUG: Print to confirm this function is being called
-        print(f"\n[DEBUG] Using custom_test_nmse with SNR range: -15 to 5 dB (step 1)\n")
+        print(f"\n[DEBUG] Using custom_test_nmse with SNR grid ({len(target_snrs)} pts): {target_snrs}\n")
         
         # Use target_snrs from outer scope (can be custom for sanity check)
         # For debug mode, only test the first SNR to speed up
@@ -1060,6 +1647,8 @@ def main() -> None:
         snr_range = 10 ** (snr_db_range / 10)
         
         nmse_total_power_list = []
+        ser_list = []
+        ser_oracle_list = []
         timings_sec = []
         steps_list = []
         tps_ms_list = []
@@ -1084,13 +1673,83 @@ def main() -> None:
             for snr_idx, snr in enumerate(tqdm(iterable=snr_range, desc="SNR sweep")):
                 snr_db = snr_db_list[snr_idx]
                 t_hat = int(torch.abs(tester.model.snrs - snr).argmin())
-                steps_list.append(int(t_hat))
+                ser_err_sum = 0.0
+                ser_oracle_err_sum = 0.0
+                ser_sym_sum = 0
                 
                 if tester.use_dps:
-                    # Note: for method='dps' we set cov_lambda=0.0 below (no covariance guidance),
-                    # but args.cov_lambda is still printed elsewhere for reproducibility of settings.
-                    print(f"\n[SNR {snr_db:.1f} dB] Processing with DPS (lambda={tester.dps_lambda:.3f}, "
-                          f"method={args.method}, cov_lambda={args.cov_lambda})...")
+                    dps_lambda_eff = float(tester.dps_lambda)
+                    if args.dynamic_dps_lambda:
+                        import math
+                        if args.dps_lambda_schedule == 'pilot_table':
+                            from modules.spatial_pilot_schedule_loader import (
+                                load_pilot_table_schedule,
+                                normalize_spatial_pilot_gamma,
+                                effective_spatial_gamma_for_pilot_table,
+                            )
+
+                            dm_no_cov = args.method == 'dps'
+                            _pt = load_pilot_table_schedule(args.pilot_mode, args.spatial_pilot_gamma)
+                            dps_lambda_eff = float(
+                                _pt.dps_lambda(float(snr_db), dm_no_cov=dm_no_cov)
+                            )
+                            _gsched = normalize_spatial_pilot_gamma(
+                                effective_spatial_gamma_for_pilot_table(
+                                    args.pilot_mode, args.spatial_pilot_gamma
+                                )
+                            )
+                            pt_tag = (
+                                f"pilot_table γ={_gsched:g} DM knots"
+                                if dm_no_cov
+                                else f"pilot_table γ={_gsched:g} DPS+COV knots"
+                            )
+                            print(
+                                f"\n[SNR {snr_db:.1f} dB] Processing with DPS ({pt_tag} lambda={dps_lambda_eff:.4f}, "
+                                f"method={args.method}, cov_lambda={args.cov_lambda})..."
+                            )
+                        elif args.dps_lambda_schedule == 'linear':
+                            dlo = float(args.dps_lambda_linear_snr_min_db)
+                            dhi = float(args.dps_lambda_linear_snr_max_db)
+                            dmin = float(args.dps_lambda_min)
+                            dmax = float(args.dps_lambda_max)
+                            span = dhi - dlo
+                            sdb_d = float(snr_db)
+                            td = (sdb_d - dlo) / span
+                            if td <= 0.0:
+                                t_clamped_d = 0.0
+                            elif td >= 1.0:
+                                t_clamped_d = 1.0
+                            else:
+                                t_clamped_d = td
+                            dps_lambda_eff = dmin + (dmax - dmin) * t_clamped_d
+                            print(
+                                f"\n[SNR {snr_db:.1f} dB] Processing with DPS (linear schedule lambda={dps_lambda_eff:.4f}, "
+                                f"t={t_clamped_d:.4f} over [{dlo:g},{dhi:g}] dB, method={args.method}, cov_lambda={args.cov_lambda})..."
+                            )
+                        else:
+                            gate_dps = 1.0 / (
+                                1.0
+                                + math.exp(
+                                    -(
+                                        (float(snr_db) - float(args.dps_lambda_snr0_db))
+                                        / float(args.dps_lambda_delta_db)
+                                    )
+                                )
+                            )
+                            dps_lambda_eff = float(args.dps_lambda_min) + (
+                                float(args.dps_lambda_max) - float(args.dps_lambda_min)
+                            ) * gate_dps
+                            print(
+                                f"\n[SNR {snr_db:.1f} dB] Processing with DPS (sigmoid lambda={dps_lambda_eff:.4f}, "
+                                f"gate={gate_dps:.3f}, method={args.method}, cov_lambda={args.cov_lambda})..."
+                            )
+                    else:
+                        # Note: for method='dps' we set cov_lambda=0.0 below (no covariance guidance),
+                        # but args.cov_lambda is still printed elsewhere for reproducibility of settings.
+                        print(
+                            f"\n[SNR {snr_db:.1f} dB] Processing with DPS (lambda={tester.dps_lambda:.3f}, "
+                            f"method={args.method}, cov_lambda={args.cov_lambda})..."
+                        )
                     if args.exp_key == 'H' and args.like_snr_gate:
                         import math
                         gate = 1.0 / (1.0 + math.exp(-((float(snr_db) - float(args.like_snr0_db)) / float(args.like_snr_delta_db))))
@@ -1110,13 +1769,73 @@ def main() -> None:
                     if args.method == 'dps':
                         cov_lambda = 0.0  # no covariance guidance
                     else:
-                        cov_lambda = float(args.cov_lambda)
+                        if args.dynamic_cov_lambda:
+                            import math
+                            cmin = float(args.cov_lambda_min)
+                            cmax = float(args.cov_lambda_max)
+                            sdb = float(snr_db)
+                            if args.cov_lambda_schedule == 'pilot_table':
+                                from modules.spatial_pilot_schedule_loader import load_pilot_table_schedule
+
+                                _pt_cov = load_pilot_table_schedule(
+                                    args.pilot_mode, args.spatial_pilot_gamma
+                                )
+                                cov_lambda = float(_pt_cov.cov_lambda(sdb))
+                                print(
+                                    f"  [Dynamic cov_lambda] SNR {snr_db:.1f} dB -> cov_lambda={cov_lambda:.5f} "
+                                    f"(pilot_table log-domain linear)"
+                                )
+                            elif args.cov_lambda_schedule == 'linear':
+                                lo = float(args.cov_lambda_linear_snr_min_db)
+                                hi = float(args.cov_lambda_linear_snr_max_db)
+                                span = hi - lo
+                                t = (sdb - lo) / span
+                                if t <= 0.0:
+                                    t_clamped = 0.0
+                                elif t >= 1.0:
+                                    t_clamped = 1.0
+                                else:
+                                    t_clamped = t
+                                cov_lambda = cmin + (cmax - cmin) * t_clamped
+                                print(
+                                    f"  [Dynamic cov_lambda] SNR {snr_db:.1f} dB -> cov_lambda={cov_lambda:.5f} "
+                                    f"(linear t={t_clamped:.4f} over [{lo:g},{hi:g}] dB)"
+                                )
+                            elif args.cov_lambda_schedule == 'plateau_linear':
+                                pu = float(args.cov_lambda_plateau_upto_db)
+                                hi = float(args.cov_lambda_linear_snr_max_db)
+                                if sdb <= pu:
+                                    t_clamped = 0.0
+                                    cov_lambda = cmin
+                                elif sdb >= hi:
+                                    t_clamped = 1.0
+                                    cov_lambda = cmax
+                                else:
+                                    span = hi - pu
+                                    t_clamped = (sdb - pu) / span
+                                    cov_lambda = cmin + (cmax - cmin) * t_clamped
+                                print(
+                                    f"  [Dynamic cov_lambda] SNR {snr_db:.1f} dB -> cov_lambda={cov_lambda:.5f} "
+                                    f"(plateau≤{pu:g} dB then ramp to {hi:g} dB, t={t_clamped:.4f})"
+                                )
+                            else:
+                                snr0_c = float(args.cov_lambda_snr0_db)
+                                delta_c = float(args.cov_lambda_delta_db)
+                                gate = 1.0 / (1.0 + math.exp(-((sdb - snr0_c) / delta_c)))
+                                cov_lambda = cmin + (cmax - cmin) * gate
+                                print(
+                                    f"  [Dynamic cov_lambda] SNR {snr_db:.1f} dB -> cov_lambda={cov_lambda:.5f} "
+                                    f"(sigmoid gate={gate:.3f}, snr0={snr0_c:g}, delta={delta_c:g})"
+                                )
+                        else:
+                            cov_lambda = float(args.cov_lambda)
 
                     dps_sampler = DpsSampler(
                         dm=tester.model,
                         likelihood_grad_fn=likelihood_grad_fn,
-                        lambda_dps=tester.dps_lambda,
+                        lambda_dps=dps_lambda_eff,
                         cov_lambda=cov_lambda,
+                        tx_cov_lambda=args.tx_cov_lambda,
                         cov_scale_mode=args.cov_scale_mode,
                         cov_beta_power=args.cov_beta_power,
                         cov_grad_norm=args.cov_grad_norm,
@@ -1137,6 +1856,9 @@ def main() -> None:
                         like_snr_gate=bool(args.like_snr_gate),
                         like_snr0_db=float(args.like_snr0_db),
                         like_snr_delta_db=float(args.like_snr_delta_db),
+                        dps_scale_mode=str(args.dps_scale_mode),
+                        sigma_eff_c=float(args.sigma_eff_c),
+                        like_clip_mode=str(args.like_clip_mode),
                     )
                     # Enable t_start-based scaling if requested
                     if args.use_t_start_scaling:
@@ -1216,8 +1938,88 @@ def main() -> None:
                         else:
                             raise ValueError(f"Unknown DPS method: {args.method}")
 
-                        # Transform y and covariance to ANGULAR domain for diffusion sampling
-                        y_ang = ut.complex_1d_fft(y_sp, ifft=False, mode=tester.mode)
+                        n_tx_sp = int(data_sp.shape[-1])
+                        n_p_sp = int(args.n_pilot)
+                        use_spatial_pilot = tester.use_dps and args.pilot_mode in (
+                            'gaussian',
+                            'nonorthogonal',
+                        )
+                        # gaussian: pure i.i.d. G (γ=0). nonorthogonal: blended pilot γ.
+                        spatial_pilot_gamma_draw = (
+                            0.0 if args.pilot_mode == 'gaussian' else float(args.spatial_pilot_gamma)
+                        )
+
+                        # Spatial pilot observation Y_p = H X_p + N; conditioning y_ang = FFT(Y_p).
+                        gauss_y_p_spatial = None
+                        gauss_X_p = None
+                        gauss_mult = None
+                        if use_spatial_pilot:
+                            dev = tester.device
+                            n_tx, n_p = n_tx_sp, n_p_sp
+                            if (
+                                args.gaussian_eta_mode == 'dataset_avg'
+                                and getattr(args, '_gaussian_dataset_avg_trace', None) is None
+                            ):
+                                from modules.gaussian_pilot_snr_match import (
+                                    monte_carlo_mean_trace_inv_over_nt,
+                                )
+
+                                args._gaussian_dataset_avg_trace = monte_carlo_mean_trace_inv_over_nt(
+                                    n_tx,
+                                    n_p,
+                                    int(args.gaussian_dataset_avg_n),
+                                    torch.device(dev),
+                                    spatial_pilot_gamma=float(spatial_pilot_gamma_draw),
+                                )
+                            if (
+                                args.gaussian_eta_mode == 'dataset_avg'
+                                and args.gaussian_snr_match_mode == 'worst'
+                                and getattr(args, '_gaussian_dataset_avg_inv_lambda_min', None) is None
+                            ):
+                                from modules.gaussian_pilot_snr_match import (
+                                    monte_carlo_mean_inv_lambda_min,
+                                )
+
+                                args._gaussian_dataset_avg_inv_lambda_min = monte_carlo_mean_inv_lambda_min(
+                                    n_tx,
+                                    n_p,
+                                    int(args.gaussian_dataset_avg_n),
+                                    torch.device(dev),
+                                    spatial_pilot_gamma=float(spatial_pilot_gamma_draw),
+                                )
+                            gen = torch.Generator(device=dev)
+                            if args.gaussian_pilot_seed is not None:
+                                gen.manual_seed(int(args.gaussian_pilot_seed) + int(batch_idx))
+                            gauss_X_p = draw_xp_sqrt_gamma_identity_gaussian_torch(
+                                n_tx,
+                                n_p,
+                                float(spatial_pilot_gamma_draw),
+                                power_norm=str(args.pilot_power_norm),
+                                device=torch.device(dev),
+                                dtype=torch.complex64,
+                                generator=gen,
+                            )
+                            H_c = torch.complex(data_sp[:, 0], data_sp[:, 1])
+                            B = H_c.shape[0]
+                            gauss_mult = float(tester.model.noise_multiplier)
+                            X_b = gauss_X_p.unsqueeze(0).expand(B, -1, -1)
+                            Y_sig = torch.bmm(H_c, X_b)
+                            scale = gauss_mult / (float(snr) ** 0.5)
+                            nr = scale * torch.randn(
+                                B, H_c.shape[1], n_p, device=dev, dtype=torch.float32
+                            )
+                            ni = scale * torch.randn(
+                                B, H_c.shape[1], n_p, device=dev, dtype=torch.float32
+                            )
+                            Y_c = Y_sig + torch.complex(nr, ni)
+                            gauss_y_p_spatial = torch.stack((Y_c.real, Y_c.imag), dim=1)
+
+                        if gauss_y_p_spatial is not None:
+                            y_ang = ut.complex_1d_fft(
+                                gauss_y_p_spatial, ifft=False, mode=tester.mode
+                            )
+                        else:
+                            y_ang = ut.complex_1d_fft(y_sp, ifft=False, mode=tester.mode)
                         cov_ang = ut.cov_spatial_to_angular(cov_sp)
 
                         if tester.use_dps:
@@ -1225,22 +2027,55 @@ def main() -> None:
                             diagnostic_recorder = None
                             if args.record_diagnostics and args.method in ('dps_cov_oracle', 'dps_cov_est') and DpsDiagnosticRecorder is not None:
                                 diagnostic_recorder = DpsDiagnosticRecorder(record_enabled=True)
-                            
+
                             # For ablation experiments, default is to disable SNR matching (use full T),
                             # but the user can override with --enable_snr_matching.
-                            if args.exp_key in ['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G'] and (not args.enable_snr_matching):
+                            if args.pilot_mode in ('gaussian', 'nonorthogonal'):
+                                snr_for_loop = None
+                            elif args.exp_key in ['A', 'B', 'C', 'D', 'E', 'Eprime', 'F', 'G'] and (not args.enable_snr_matching):
+                                snr_for_loop = None
+                            elif args.exp_key == 'H' and args.no_h_snr_match:
                                 snr_for_loop = None
                             else:
                                 snr_for_loop = snr
-                            
+
+                            gen_kw = dict(
+                                return_all_timesteps=tester.return_all_timesteps,
+                                num_steps=args.num_steps,
+                                snr=snr_for_loop,
+                                obs_snr_db=float(snr_db),
+                                diagnostic_recorder=diagnostic_recorder,
+                                tx_cov_lambda=args.tx_cov_lambda,
+                            )
+                            if args.dps_t_start is not None:
+                                gen_kw['t_start_override'] = int(args.dps_t_start)
+                            if gauss_y_p_spatial is not None:
+                                gen_kw['pilot_matrix_X_p'] = gauss_X_p
+                                gen_kw['y_p_spatial'] = gauss_y_p_spatial
+                                gen_kw['spatial_fft_mode'] = tester.mode
+                                gen_kw['pilot_likelihood_mode'] = (
+                                    'nonorthogonal'
+                                    if args.pilot_mode == 'nonorthogonal'
+                                    else 'gaussian'
+                                )
+                                gen_kw['pilot_likelihood_domain'] = str(args.pilot_likelihood_domain)
+                                gen_kw['gaussian_snr_match'] = args.gaussian_pilot_init == 'snr_match'
+                                if args.gaussian_pilot_init == 'snr_match':
+                                    gen_kw['gaussian_rho_linear'] = float(snr)
+                                    gen_kw['noise_multiplier'] = gauss_mult
+                                    gen_kw['gaussian_eta_mode'] = args.gaussian_eta_mode
+                                    gen_kw['gaussian_snr_match_mode'] = args.gaussian_snr_match_mode
+                                    if args.gaussian_eta_mode == 'dataset_avg':
+                                        gen_kw['dataset_avg_trace_over_nt'] = args._gaussian_dataset_avg_trace
+                                        if args.gaussian_snr_match_mode == 'worst':
+                                            gen_kw['dataset_avg_inv_lambda_min'] = (
+                                                args._gaussian_dataset_avg_inv_lambda_min
+                                            )
+
                             x_est = dps_sampler.generate_posterior_sample(
                                 y_ang.to(device=tester.device),
                                 cov=cov_ang.to(device=tester.device),
-                                return_all_timesteps=tester.return_all_timesteps,
-                                num_steps=args.num_steps,
-                                snr=snr_for_loop,  # Pass None for ablation to use full T
-                                obs_snr_db=float(snr_db),
-                                diagnostic_recorder=diagnostic_recorder,
+                                **gen_kw,
                             )
                             
                             # NMSE FFT invariance diagnostic tests (optional, only if --run_fft_diagnostics is set)
@@ -1282,7 +2117,7 @@ def main() -> None:
                                 diagnostic_summaries.append(summary)
                         else:
                             x_est = tester.model.generate_estimate(
-                                y.to(device=tester.device), snr,
+                                y_ang.to(device=tester.device), snr,
                                 return_all_timesteps=tester.return_all_timesteps,
                             )
                         
@@ -1292,6 +2127,29 @@ def main() -> None:
                         else:
                             x_est = ut.complex_1d_fft(x_est, ifft=True, mode=tester.mode)
                         
+                        # Optional SER evaluation (use spatial-domain H and H_hat)
+                        if args.compute_ser:
+                            # 1. SER using estimated channel H_hat
+                            ser_b, n_sym_b = det.ser_mmse_from_channel_estimates_torch(
+                                H_true_ri=data_sp,
+                                H_hat_ri=x_est,
+                                snr_linear=float(snr),
+                                n_sym=int(args.n_data_symbols),
+                                modulation=str(args.det_modulation),
+                            )
+                            ser_err_sum += float(ser_b) * float(n_sym_b)
+                            ser_sym_sum += int(n_sym_b)
+
+                            # 2. Oracle SER using true channel H_true
+                            ser_oracle_b, _ = det.ser_mmse_from_channel_estimates_torch(
+                                H_true_ri=data_sp,
+                                H_hat_ri=data_sp,  # Perfect CSI
+                                snr_linear=float(snr),
+                                n_sym=int(args.n_data_symbols),
+                                modulation=str(args.det_modulation),
+                            )
+                            ser_oracle_err_sum += float(ser_oracle_b) * float(n_sym_b)
+
                         x_hat.append(x_est)
                         
                         # Save debug CSV after first sample
@@ -1371,9 +2229,34 @@ def main() -> None:
                                 r_vals = [r['r_t'] for r in rows]
                                 print(f"\n  [Like-balance] Saved CSV: {csv_file}")
                                 print(f"    r_t = L_t/(P_t+eps): min={min(r_vals):.3e}, mean={sum(r_vals)/len(r_vals):.3e}, max={max(r_vals):.3e}")
+                                
+                        # Clean up GPU memory IMMEDIATELY and COMPLETELY
+                        del x_est, y_sp, y_ang, data_batch, data_sp
+                        if 'cov_sp' in locals():
+                            del cov_sp
+                        if 'cov_ang' in locals():
+                            del cov_ang
+                        if tester.device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                            
                     except Exception as e:
                         print(f"Error in batch {batch_idx}: {e}")
                         raise
+                
+                # 再次执行清理，防止循环结束时有遗漏
+                if tester.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
+                # CSV column "steps": diffusion start index t_start. For gaussian/nonorthogonal + snr_match
+                # this is sm["t_start"] (trace/worst), not t_hat = argmin|dm.snrs - rho|.
+                if (
+                    tester.use_dps
+                    and dps_sampler is not None
+                    and getattr(dps_sampler, "_last_t_start", None) is not None
+                ):
+                    steps_list.append(int(dps_sampler._last_t_start))
+                else:
+                    steps_list.append(int(t_hat))
                 
                 x_hat = torch.cat(x_hat, dim=0).cpu()
                 
@@ -1401,6 +2284,10 @@ def main() -> None:
                         norm_per_sample=False
                     )
                     nmse_total_power_list.append(nmse_val)
+
+                if args.compute_ser:
+                    ser_list.append(float(ser_err_sum / max(float(ser_sym_sum), 1.0)))
+                    ser_oracle_list.append(float(ser_oracle_err_sum / max(float(ser_sym_sum), 1.0)))
                 
                 # Log t_start scaling info with NMSE if enabled
                 if tester.use_dps and args.use_t_start_scaling and hasattr(dps_sampler, '_last_t_start'):
@@ -1423,6 +2310,9 @@ def main() -> None:
             'Timings_sec': timings_sec,
             'Time_per_sample_ms': tps_ms_list,
         }
+        if args.compute_ser:
+            result_dict['SERs'] = ser_list
+            result_dict['SERs_oracle'] = ser_oracle_list
         
         # Add diagnostic summaries if recorded
         if diagnostic_summaries:
@@ -1431,17 +2321,31 @@ def main() -> None:
         return result_dict
     
     # Test each lambda value
-    timestamp = dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     num_timesteps = sim_params['diff_model_dict']['num_timesteps']
     # Save DPS results in a separate folder from pure DM results
     # (DM uses results/dm_est, DPS uses results/dm_dps)
     base_dir = cwd / 'results' / 'dm_dps'
     base_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f'{timestamp}_{ch_type}_dim={n_dim}x{n_dim2}_valdata={num_val}_T={num_timesteps}'
+    run_ts = dt.datetime.now().strftime('%y%m%d_%H%M%S')
+    prefix = build_dps_export_prefix(ch_type, n_dim, n_dim2, num_val, num_timesteps, ts=run_ts)
     
     # Store results for all lambdas (for comparison)
     all_results = []
-    
+
+    if args.dynamic_dps_lambda and len(args.dps_lambdas) > 1:
+        if args.dps_lambda_schedule == 'pilot_table':
+            print(
+                "[Note] --dynamic_dps_lambda + pilot_table: per-SNR knots from spatial_pilot_schedule_g*; "
+                "ignoring extra --dps_lambda list entries."
+            )
+            args.dps_lambdas = [float(args.dps_lambdas[0])]
+        else:
+            print(
+                "[Note] --dynamic_dps_lambda (sigmoid/linear): per-SNR schedule uses --dps_lambda_min/max; "
+                "ignoring extra --dps_lambda list entries."
+            )
+            args.dps_lambdas = [float(args.dps_lambda_min)]
+
     for lambda_idx, dps_lambda in enumerate(args.dps_lambdas):
         print(f"\n{'='*60}")
         print(f"Testing lambda = {dps_lambda} ({lambda_idx + 1}/{len(args.dps_lambdas)})")
@@ -1466,6 +2370,8 @@ def main() -> None:
         steps = test_dict['nmse'].get('Steps', [None] * len(snrs))
         times = test_dict['nmse'].get('Timings_sec', [None] * len(snrs))
         tps = test_dict['nmse'].get('Time_per_sample_ms', [None] * len(snrs))
+        sers = test_dict['nmse'].get('SERs', None)
+        sers_oracle = test_dict['nmse'].get('SERs_oracle', None)
         diagnostic_summaries = test_dict['nmse'].get('diagnostic_summaries', [])
         
         # Note: diagnostic_summaries are collected per SNR point in custom_test_nmse
@@ -1486,46 +2392,32 @@ def main() -> None:
         else:
             method_name = args.method.upper()
 
-        suffix = f'_method={method_name}_dps_lambda={dps_lambda}_sigma={args.sigma_y2}'
-        if args.method in ('dps_cov_oracle', 'dps_cov_est'):
-            suffix += f'_cov_lambda={args.cov_lambda}'
-            if args.cov_beta_power is not None:
-                suffix += f'_scale=beta_pow{args.cov_beta_power:g}'
-            else:
-                suffix += f'_scale={args.cov_scale_mode}'
-            suffix += f'_clip={args.cov_clip_mode}'
-            if args.use_t_start_scaling:
-                suffix += '_tstart_scaled'
-        if args.method == 'dps_cov_est':
-            suffix += f'_ntime={args.n_time_samples}_mod={args.modulation}'
-        # Add experiment key to suffix for ablation experiments
-        if args.exp_key != 'A':
-            suffix += f'_exp={args.exp_key}'
-            # For experiment D, also include gamma value
-            if args.exp_key == 'D':
-                suffix += f'_gamma={args.gamma:.2f}'
-            # For experiment E/Eprime, add explicit tag
-            if args.exp_key == 'E':
-                suffix += '_closedform'
-            if args.exp_key == 'Eprime':
-                suffix += '_closedform_postadd'
-            if args.exp_key == 'F':
-                suffix += '_paper'
-        
-        rows_full = list(zip(snrs, nmse_final, steps, times, tps))
+        suffix = build_dps_export_suffix(args, method_name, dps_lambda)
+
+        if sers is not None and sers_oracle is not None:
+            rows_full = list(zip(snrs, nmse_final, sers, sers_oracle, steps, times, tps))
+            headers_full = ['SNR', 'nmse_dm_dps', 'ser_mmse', 'ser_oracle', 'steps', 'time_s', 'time_per_sample_ms']
+        else:
+            rows_full = list(zip(snrs, nmse_final, steps, times, tps))
+            headers_full = ['SNR', 'nmse_dm_dps', 'steps', 'time_s', 'time_per_sample_ms']
         export_table(
             base_dir,
             prefix,
-            headers=['SNR', 'nmse_dm_dps', 'steps', 'time_s', 'time_per_sample_ms'],
+            headers=headers_full,
             rows=rows_full,
             suffix=suffix,
         )
         
-        rows_best = list(zip(snrs, nmse_final))
+        if sers is not None and sers_oracle is not None:
+            rows_best = list(zip(snrs, nmse_final, sers, sers_oracle))
+            headers_best = ['SNR', 'nmse_dm_dps', 'ser_mmse', 'ser_oracle']
+        else:
+            rows_best = list(zip(snrs, nmse_final))
+            headers_best = ['SNR', 'nmse_dm_dps']
         export_table(
             base_dir,
             prefix,
-            headers=['SNR', 'nmse_dm_dps'],
+            headers=headers_best,
             rows=rows_best,
             suffix=suffix + '_best',
         )
@@ -1544,7 +2436,7 @@ def main() -> None:
             diag_dir.mkdir(parents=True, exist_ok=True)
             for summary in diagnostic_summaries:
                 snr_val = summary.get('snr_db', 'unknown')
-                diag_file = diag_dir / f'{timestamp}_snr{snr_val:.1f}_summary.txt'
+                diag_file = diag_dir / f'{run_ts}_snr{snr_val:.1f}_summary.txt'
                 with open(diag_file, 'w') as f:
                     f.write(f"DPS-COV Diagnostic Summary (SNR={snr_val} dB)\n")
                     f.write("=" * 60 + "\n\n")
@@ -1552,13 +2444,39 @@ def main() -> None:
                     f.write(f"  Method: {method_name}\n")
                     f.write(f"  DPS lambda: {dps_lambda}\n")
                     if args.method in ('dps_cov_oracle', 'dps_cov_est'):
-                        f.write(f"  Cov lambda: {args.cov_lambda}\n")
+                        if args.dynamic_cov_lambda:
+                            if args.cov_lambda_schedule == 'linear':
+                                f.write(
+                                    "  Cov lambda: DYNAMIC linear "
+                                    f"{args.cov_lambda_min:g}..{args.cov_lambda_max:g} "
+                                    f"over [{args.cov_lambda_linear_snr_min_db:g}, {args.cov_lambda_linear_snr_max_db:g}] dB\n"
+                                )
+                            elif args.cov_lambda_schedule == 'plateau_linear':
+                                f.write(
+                                    "  Cov lambda: DYNAMIC plateau+linear "
+                                    f"{args.cov_lambda_min:g} for SNR ≤ {args.cov_lambda_plateau_upto_db:g} dB, "
+                                    f"ramp to {args.cov_lambda_max:g} at {args.cov_lambda_linear_snr_max_db:g} dB\n"
+                                )
+                            elif args.cov_lambda_schedule == 'pilot_table':
+                                f.write(
+                                    "  Cov lambda: DYNAMIC pilot_table log-domain linear "
+                                    "(modules/spatial_pilot_schedule_g* by --spatial_pilot_gamma)\n"
+                                )
+                            else:
+                                f.write(
+                                    "  Cov lambda: DYNAMIC sigmoid "
+                                    f"{args.cov_lambda_min:g}..{args.cov_lambda_max:g} "
+                                    f"(snr0={args.cov_lambda_snr0_db:g} dB, delta={args.cov_lambda_delta_db:g} dB)\n"
+                                )
+                        else:
+                            f.write(f"  Cov lambda: {args.cov_lambda}\n")
                         f.write(f"  Cov scale mode: {args.cov_scale_mode}\n")
                         if args.cov_beta_power is not None:
                             f.write(f"  Cov beta power override: {args.cov_beta_power} (zeta_t = beta_t**p)\n")
                         f.write(f"  Cov grad norm: {args.cov_grad_norm}\n")
                         f.write(f"  Cov step clip: {args.cov_step_clip}\n")
                         f.write(f"  Cov clip mode: {args.cov_clip_mode}\n")
+                        f.write(f"  DPS likelihood clip mode: {args.like_clip_mode}\n")
                     f.write(f"\nMid-to-Late Stage Statistics (t in [0.6T, 0.9T]):\n")
                     f.write(f"  Mean(c_t / b_t): {summary.get('mean_c_over_b', 'N/A'):.6f}\n")
                     f.write(f"  Mean(clip_rate_cov): {summary.get('mean_clip_rate_cov', 'N/A'):.6f}\n")
@@ -1611,12 +2529,9 @@ def main() -> None:
             for snr, nmse in zip(result['snrs'], result['nmse']):
                 comparison_rows.append([result['lambda'], snr, nmse])
         
-        comparison_suffix = f'_method={method_name}_comparison_all_lambdas_sigma={args.sigma_y2}'
-        if args.method in ('dps_cov_oracle', 'dps_cov_est'):
-            comparison_suffix += f'_cov_lambda={args.cov_lambda}'
-            comparison_suffix += f'_scale={args.cov_scale_mode}'
-        if args.method == 'dps_cov_est':
-            comparison_suffix += f'_ntime={args.n_time_samples}_mod={args.modulation}'
+        comparison_suffix = build_dps_export_suffix(
+            args, method_name, float(args.dps_lambdas[0]), comparison=True
+        )
         export_table(
             base_dir,
             prefix,

@@ -797,7 +797,7 @@ class FlowTrainer(object):
         for key in metrics.keys():
             msg += f' {key} = {metrics[key]} |'
         msg = msg[:-1]
-        print(msg)
+        print(msg, flush=True)
 
     def train(self) -> Dict:
         """Main training loop for the FlowModel instance."""
@@ -844,7 +844,7 @@ class FlowTrainer(object):
 
             stopping = early_stopping(val_loss=val_loss, epoch=self.epoch)
             if stopping:
-                print('Early stopping. End of training.')
+                print('Early stopping. End of training.', flush=True)
                 break
 
             self.lr_scheduler.step()
